@@ -184,6 +184,11 @@
  */
 #define PORTNO               @val_portno@
 
+#define COMPILERMODE               @val_compilermode@
+#if COMPILERMODE == 0
+	#undef COMPILERMODE
+#endif
+
 /* Define this to the port on which the driver can receive UDP message.
  * If set to -1, the port will not be opened unless the mud is given a valid
  * port number on startup with the -u commandline option.

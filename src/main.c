@@ -706,14 +706,17 @@ main (int argc, char **argv)
         /* Start the backend loop. This won't return before
          * the game shuts down.
          */
+#ifndef COMPILERMODE
         backend();
+#endif
 
         /* Shutdown the game.
          */
 
         rc = exit_code;
+#ifndef COMPILERMODE
         printf("%s LDMud shutting down.\n", time_stamp());
-
+#endif
         callback_master(STR_NOTIFY_SHUTDOWN, 0);
         ipc_remove();
         remove_all_players();

@@ -112,8 +112,10 @@ pkg_mysql_init (void)
         if (cl_version > s_version)
             return MY_FALSE;
     }
+#ifndef COMPILERMODE
     printf("%s mySQL %s\n", time_stamp(), client_version);
     debug_message("%s mySQL %s\n", time_stamp(), client_version);
+#endif
     return MY_TRUE;
 } /* pkg_mysql_init() */
 

@@ -21390,12 +21390,14 @@ warn_missing_function_ob (object_t* ob, string_t* fun)
         cur = (cur->flags & O_SHADOW) ? O_GET_SHADOW(cur)->shadowing : NULL;
     }
 
+#ifndef COMPILERMODE
     if (!cur)
     {
         warnf("Function %.50s() not found in /%s.\n"
             , get_txt(fun)
             , get_txt(ob->name));
     }
+#endif
 } /* warn_missing_function_ob() */
 
 /*-------------------------------------------------------------------------*/

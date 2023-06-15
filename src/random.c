@@ -92,11 +92,12 @@ void seed_random_from_int (uint32_t seed)
 /* Initialize the generator */
 
 {
+#ifndef COMPILERMODE
     printf("%s Seeding PRNG with: 0x%lx\n"
                  , time_stamp(), (unsigned long)seed);
     debug_message("%s Seeding PRNG with: 0x%lx\n"
                  , time_stamp(), (unsigned long)seed);
-
+#endif
     init_gen_rand(seed);
 } /* seed_random_from_int() */
 
@@ -127,19 +128,23 @@ seed_random(const char *filename)
         fclose(seedsrc);
         if( count == INIT_ARRAY_SIZE ) {
             init_by_array(seeddata, INIT_ARRAY_SIZE ); // seed PRNG
+#ifndef COMPILERMODE
             printf("%s Seeding PRNG from %s.\n", time_stamp(),
                     filename);
             debug_message("%s Seeding PRG from %s.\n", time_stamp(),
                     filename);
+#endif
             return;
         } // if (count == INIT_ARRAY_SIZE)
     } // if (seedsrc)
     
     // Fall-back: driver clock
+#ifndef COMPILERMODE
     printf("%s Seeding PRNG with current driver time\n"
                  , time_stamp());
     debug_message("%s Seeding PRNG with current driver time\n"
                  , time_stamp());
+#endif
     seed_random_from_int((uint32_t)current_time);
 
 } /* seed_random() */

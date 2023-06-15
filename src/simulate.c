@@ -882,8 +882,10 @@ errorf (const char *fmt, ...)
                 /* Even though caught, dump the backtrace - it makes mudlib
                  * debugging much easier.
                  */
+#ifndef COMPILERMODE
                 debug_message("%s Caught error: %s", ts, emsg_buf + 1);
                 printf("%s Caught error: %s", ts, emsg_buf + 1);
+#endif
                 if (current_error_trace)
                 {
                     free_array(current_error_trace);
@@ -895,8 +897,10 @@ errorf (const char *fmt, ...)
                     current_error_trace_string = NULL;
                 }
                 object_name = dump_trace(MY_FALSE, &current_error_trace, &current_error_trace_string);
+#ifndef COMPILERMODE
                 debug_message("%s ... execution continues.\n", ts);
                 printf("%s ... execution continues.\n", ts);
+#endif
             }
             else
             {
@@ -1880,7 +1884,7 @@ load_object (const char *lname, Bool create_super, int depth
      * during the compilation process.
      * The memory is allocated in one chunk for both strings and an error 
      * handler is pushed on the stack (additionally is needed: memory for '/' 
-     * and '\0â€™ (sizeof("/")) and '/', '\0', '.' and 'c' (sizeof("/.c"))).
+     * and '\0‚ÇÖ (sizeof("/")) and '/', '\0', '.' and 'c' (sizeof("/.c"))).
      */
     name = xalloc_with_error_handler(2 * name_length + sizeof("/") + 
                                      sizeof("/.c"));

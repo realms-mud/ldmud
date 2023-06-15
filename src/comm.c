@@ -1080,6 +1080,7 @@ initialize_host_ip_number (const char *hname, const char * haddr)
             domain = strchr(host_name, '.');
     }
 
+#ifndef COMPILERMODE
 #ifndef USE_IPV6
     printf("%s Hostname '%s' address '%s'\n"
           , time_stamp(), host_name, inet_ntoa(host_ip_number));
@@ -1091,7 +1092,7 @@ initialize_host_ip_number (const char *hname, const char * haddr)
     debug_message("%s Hostname '%s' address '%s'\n"
                  , time_stamp(), host_name, inet6_ntoa(host_ip_number));
 #endif
-
+#endif
     /* Put the domain name part of the hostname into domain_name, then
      * strip it off the host_name[] (as only query_host_name() is going
      * to need it).
@@ -1119,8 +1120,10 @@ initialize_host_ip_number (const char *hname, const char * haddr)
         memcpy(&host_ip_addr, &host_ip_addr_template, sizeof(host_ip_addr));
 
         host_ip_addr.sin_port = htons((u_short)udp_port);
+#ifndef COMPILERMODE
         debug_message("%s UDP recv-socket requested for port: %d\n"
                      , time_stamp(), udp_port);
+#endif
         udp_s = socket(host_ip_addr.sin_family, SOCK_DGRAM, 0);
         if (udp_s == -1)
         {
@@ -1177,9 +1180,11 @@ initialize_host_ip_number (const char *hname, const char * haddr)
             int oldport = udp_port;
 
             udp_port = ntohs(host_ip_addr.sin_port);
+#ifndef COMPILERMODE
             if (oldport != udp_port)
                 debug_message("%s UDP recv-socket on port: %d\n"
                              , time_stamp(), udp_port);
+#endif
         }
         set_socket_nonblocking(udp_s);
         set_close_on_exec(udp_s);
@@ -1321,7 +1326,9 @@ ipc_remove (void)
 {
     int i;
 
+#ifndef COMPILERMODE
     printf("%s Shutting down ipc...\n", time_stamp());
+#endif
     for (i = 0; i < numports; i++)
         socket_close(sos[i]);
 
@@ -5668,12 +5675,12 @@ start_erq_demon (const char *suffix, size_t suffixlen)
         perror("socketpair");
         return;
     }
-
+#ifndef COMPILERMODE
     printf("%s Attempting to start erq '%s%s'.\n"
           , time_stamp(), erq_file, suffix);
     debug_message("%s Attempting to start erq '%s%s'.\n"
                  , time_stamp(), erq_file, suffix);
-
+#endif
     /* Close inherited sockets first. */
     for (i = 0; i < numports; i++)
         if (port_numbers[i] < 0)
@@ -5725,9 +5732,10 @@ start_erq_demon (const char *suffix, size_t suffixlen)
     read(sockets[1], &c, 1);
     if (c == '0') {
         close(sockets[1]);
-
+#ifndef COMPILERMODE
         printf("%s Failed to start erq.\n", time_stamp());
         debug_message("%s Failed to start erq.\n", time_stamp());
+#endif
         return;
     }
 
