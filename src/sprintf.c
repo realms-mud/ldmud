@@ -86,6 +86,8 @@
 #include "mapping.h"
 #include "mstrings.h"
 #include "object.h"
+#include "pkg-python.h"
+#include "prolang.h"
 #include "ptrtable.h"
 #include "random.h"
 #include "sent.h"
@@ -1193,6 +1195,26 @@ svalue_to_string ( fmt_state_t *st
 
         break;
       }
+
+    case T_LPCTYPE:
+      {
+        stradd(st, &str, "[");
+        stradd(st, &str, get_lpctype_name(obj->u.lpctype));
+        stradd(st, &str, "]");
+
+        break;
+      }
+
+#ifdef USE_PYTHON
+    case T_PYTHON:
+      {
+        string_t *rc = python_ob_to_string(obj);
+        stradd(st, &str, get_txt(rc));
+        free_mstring(rc);
+
+        break;
+      }
+#endif
 
   default:
       stradd(st, &str, "!ERROR: GARBAGE SVALUE (");

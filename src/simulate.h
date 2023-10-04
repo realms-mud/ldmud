@@ -80,6 +80,7 @@ struct rt_context_s
 #define CATCH_FLAG_RESERVE (0x04)  /* The amount of ticks to keep in reserve
                                     * is given on the stack.
                                     */
+#define CATCH_FLAG_LIMIT   (0x08)  /* The eval limit is given on the stack. */
 
 
 #define ERROR_RECOVERY_CONTEXT(t) ((t) >= ERROR_RECOVERY_NONE)
@@ -124,16 +125,21 @@ struct error_recovery_info
  * information about the function to call and the arguments to pass.
  */
 
-struct callback_s {
-    union {               /* The function to call: by name or the closure */
-        struct {
-            string_t *name;  /* the tabled function name */
-            svalue_t  ob;    /* reference to the object to call */
+struct callback_s
+{
+    union
+    {
+        /* The function to call: by name or the closure */
+        struct
+        {
+            string_t *name;     /* the tabled function name */
+            svalue_t  ob;       /* reference to the object to call */
         } named;
-        svalue_t lambda;     /* the closure to call */
+        svalue_t closure;       /* the closure to call */
     } function;
-    Bool is_lambda;         /* Closure or named function? */
-    int         num_arg;    /* Number of arguments */
+    bool is_closure;            /* Closure or named function? */
+
+    int         num_arg;        /* Number of arguments */
     svalue_t    arg;
       /* Arguments to pass:
        *   - T_INVALID if no arguments
@@ -250,7 +256,7 @@ extern char *filesystem_encoding;
 
 /* --- Prototypes --- */
 
-extern Bool catch_instruction (int flags, uint offset, volatile svalue_t ** volatile i_sp, bytecode_p i_pc, svalue_t * i_fp, int32 reserve_cost, svalue_t *i_context);
+extern Bool catch_instruction (int flags, unsigned int offset, volatile svalue_t ** volatile i_sp, bytecode_p i_pc, svalue_t * i_fp, int32 reserve_cost, int32 limit_eval, svalue_t *i_context);
 extern void check_shadow_sent (object_t *ob);
 extern void assert_shadow_sent (object_t *ob);
 extern void init_empty_callback (callback_t *cb);

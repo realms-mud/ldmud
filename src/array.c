@@ -1252,7 +1252,7 @@ match_arrays (vector_t *vec1, vector_t *vec2)
             /* Even more special case: both vectors have just one elem */
             if (len2 == 1)
             {
-                if (!rvalue_eq(vec1->item, vec2->item))
+                if (rvalue_eq(vec1->item, vec2->item))
                 {
                     flags[0] = flags[1] = MY_TRUE;
                 }
@@ -1281,7 +1281,7 @@ match_arrays (vector_t *vec1, vector_t *vec2)
          */
         for ( ; rlen != 0; rlen--, rover++, rflag++)
         {
-            if (!rvalue_eq(rover, elem))
+            if (rvalue_eq(rover, elem))
                 *rflag = *eflag = MY_TRUE;
         }
 
@@ -1332,7 +1332,7 @@ match_arrays (vector_t *vec1, vector_t *vec2)
                     index1++;
                     len1--;
                     if (len1 != 0)
-                        d = rvalue_eq(test_val, vec1->item + *index1);
+                        d = rvalue_eq(test_val, vec1->item + *index1) ? 0 : -1;
                 }
                 while (len1 != 0 && d == 0);
 
@@ -1341,7 +1341,7 @@ match_arrays (vector_t *vec1, vector_t *vec2)
                     index2++;
                     len2--;
                     if (len2 != 0)
-                        d = rvalue_eq(test_val, vec2->item + *index2);
+                        d = rvalue_eq(test_val, vec2->item + *index2) ? 0 : -1;
                 }
                 while (len2 != 0 && d == 0);
 
@@ -1962,7 +1962,7 @@ v_allocate (svalue_t *sp, int num_arg)
             {
                 errorf("Bad argument to allocate(): size[%d] is a '%s', "
                       "expected 'int'.\n"
-                     , (int)dim, typename(item->type));
+                     , (int)dim, sv_typename(item));
                 /* NOTREACHED */
             }
 
@@ -2061,7 +2061,7 @@ v_allocate (svalue_t *sp, int num_arg)
     {
         /* The type checker should prevent this case */
         fatal("Illegal arg 1 to allocate(): got '%s', expected 'int|int*'.\n"
-             , typename(argp->type));
+             , sv_typename(argp));
     } /* if (argp->type) */
 
     if (num_arg == 2)
@@ -2462,7 +2462,7 @@ v_sort_array (svalue_t * sp, int num_arg)
                         inter_sp = sp;
                         errorf("Bad arg 1 to sort_array(): got '%s[..] &', "
                                "expected 'mixed * / mixed *&'.\n"
-                               , typename(r->vec.type));
+                               , sv_typename(&(r->vec)));
                         // NOTREACHED
                         return sp;
                     }
@@ -2510,7 +2510,7 @@ v_sort_array (svalue_t * sp, int num_arg)
             inter_sp = sp;
             errorf("Bad arg 1 to sort_array(): got '%s &', "
                    "expected 'mixed * / mixed *&'.\n"
-                   , typename(svp->type));
+                   , sv_typename(svp));
             // NOTREACHED
             return sp;
         }
@@ -3215,6 +3215,8 @@ sameval (svalue_t *arg1, svalue_t *arg2)
         return arg1->u.lwob == arg2->u.lwob;
     } else if (arg1->type == T_COROUTINE && arg2->type == T_COROUTINE) {
         return arg1->u.coroutine == arg2->u.coroutine;
+    } else if (arg1->type == T_LPCTYPE && arg2->type == T_LPCTYPE) {
+        return arg1->u.lpctype == arg2->u.lpctype;
     } else
         return 0;
 } /* sameval() */
@@ -3397,23 +3399,23 @@ make_unique (vector_t *arr, callback_t *cb, svalue_t *skipnum)
              * change the object the callback is bound to to call the
              * discriminator function in it.
              */
-            if (!cb->is_lambda)
+            if (!cb->is_closure)
                 callback_change_object(cb, item->u.ob);
             else
                 push_ref_object(inter_sp, item->u.ob, "unique_array");
 
-            v = apply_callback(cb, cb->is_lambda ? 1 : 0);
+            v = apply_callback(cb, cb->is_closure ? 1 : 0);
             if (v && !sameval(v, skipnum))
                 ant = put_in(pool, &head, v, item);
         }
         else if (item->type == T_LWOBJECT)
         {
-            if (!cb->is_lambda)
+            if (!cb->is_closure)
                 callback_change_lwobject(cb, item->u.lwob);
             else
                 push_ref_lwobject(inter_sp, item->u.lwob);
 
-            v = apply_callback(cb, cb->is_lambda ? 1 : 0);
+            v = apply_callback(cb, cb->is_closure ? 1 : 0);
             if (v && !sameval(v, skipnum))
                 ant = put_in(pool, &head, v, item);
         }

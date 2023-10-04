@@ -151,7 +151,7 @@ reset_lwobject (lwobject_t *lwob, int hook, int num_arg)
     if (driver_hook[hook].type == T_CLOSURE)
     {
         if (driver_hook[hook].x.closure_type != CLOSURE_UNBOUND_LAMBDA
-         || driver_hook[hook].u.lambda->function.code.num_arg)
+         || driver_hook[hook].u.lambda->num_arg)
         {
             /* Closure accepts at least one argument,
              * so it gets the target object there and we execute
@@ -477,7 +477,7 @@ f_configure_lwobject (svalue_t *sp)
             else if (sp->type == T_NUMBER && sp->u.number == 0)
                 lwob->eff_user = 0;
             else
-                efun_arg_error(2, T_STRING, sp->type, sp);
+                efun_arg_error(2, T_STRING, sp, sp);
         break;
     }
 

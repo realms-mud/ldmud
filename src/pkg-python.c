@@ -4,6 +4,22 @@
  * This file contains the glue for the interaction between
  * python and the LPC runtime.
  *------------------------------------------------------------------
+ * For a context switch from LPC to Python the following needs to
+ * happen:
+ *  - python_start_thread(), acquires the Python GIL. This needs
+ *    to happen for every access to a Python object.
+ *  - python_save_context(): Save the current object and command
+ *    giver. (python_clear_context() for external calls).
+ *  - set python_is_external accordingly.
+ *
+ * When calling LPC from Python:
+ *  - python_restore_context(): Restore current object and command
+ *    giver.
+ *
+ * When returning to LPC from Python:
+ *  - If python_is_external was changed, restore the previous value.
+ *  - python_finish_thread()
+ *------------------------------------------------------------------
  */
 #include "driver.h"
 #include "machine.h"
@@ -100,10 +116,16 @@ enum python_structmember_type
 #define USE_PYTHON_CONTEXT
 #endif
 
+#define REAL_EFUN_COUNT (EFUN_COUNT + EFUN1_COUNT + EFUN2_COUNT + EFUN3_COUNT + EFUN4_COUNT + EFUNV_COUNT)
+
 /* --- Type declarations --- */
 typedef struct ldmud_gc_var_s ldmud_gc_var_t;
+typedef struct ldmud_gc_lpctype_type_s ldmud_gc_lpctype_type_t;
+typedef struct ldmud_concrete_struct_type_s ldmud_concrete_struct_type_t;
 typedef void (*CClosureFun)(int,void*);
+typedef struct python_efun_info_s python_efun_info_t;
 typedef struct python_efun_s python_efun_t;
+typedef struct python_type_entry_s python_type_entry_t;
 typedef struct python_poll_fds_s python_poll_fds_t;
 typedef struct python_hook_s python_hook_t;
 
@@ -147,10 +169,8 @@ enum visibility
 };
 
 /* --- Type definitions --- */
-struct python_efun_s
+struct python_efun_info_s
 {
-    PyObject*   callable;       /* Python callable of the efun.        */
-    ident_t*    name;           /* The identifier of the efun.         */
     lpctype_t** types;          /* The return type and argument types:
                                  *   [0]:           return type
                                  *   [1 .. maxarg]: argument types
@@ -158,7 +178,29 @@ struct python_efun_s
                                  */
     int         minarg;         /* Minimum number of arguments.        */
     int         maxarg;         /* Maximum number of arguments.        */
-    bool        varargs;        /* Whether we have a variable number.  */
+    bool        varargs :1;     /* Whether we have a variable number.  */
+    bool        exists  :1;     /* Whether the fun actually exists
+                                 * (only used in python_type_entry_s).
+                                 */
+};
+
+struct python_efun_s
+{
+    PyObject*          callable;/* Python callable of the efun.        */
+    ident_t*           name;    /* The identifier of the efun.         */
+    python_efun_info_t info;    /* Additional type information.        */
+};
+
+struct python_type_entry_s
+{
+    PyObject*   pytype;         /* Python type object for this type.    */
+    lpctype_t*  lpctype;        /* Corresponding LPC type object (ref). */
+    ident_t*    name;           /* The identifier of the type.          */
+
+    python_type_operation_t op[PYTHON_OPERATIONS_COUNT];
+                                /* Operations for this type.            */
+    python_efun_info_t efun[REAL_EFUN_COUNT];
+                                /* Available efun overrides.            */
 };
 
 struct python_poll_fds_s
@@ -191,7 +233,12 @@ struct python_replace_program_protector
 char * python_startup_script = NULL;
 
 static volatile bool python_pending_sigchld = false;
- /* We received a SIGCHLD and need to pass it to Python.
+static volatile bool python_pending_sigint = false;
+static volatile bool python_pending_sigterm = false;
+static volatile bool python_pending_sighup = false;
+static volatile bool python_pending_sigusr1 = false;
+static volatile bool python_pending_sigusr2 = false;
+ /* We received a signal and need to pass it to Python.
   */
 
 static bool python_is_external = true;
@@ -208,6 +255,49 @@ static python_efun_t python_efun_table[PYTHON_EFUN_TABLE_SIZE];
   /* Information about all defined efuns.
    */
 
+int num_python_type = 0;
+
+ident_t *all_python_types = NULL;
+
+long num_lpc_python_references = 0;
+
+long num_python_lpc_references = 0;
+
+static python_type_entry_t* python_type_table[PYTHON_TYPE_TABLE_SIZE];
+  /* Information about all defined Python types.
+   *
+   * Each entry is quite big, therefore we allocate it only for
+   * registered types.
+   */
+
+static struct python_operation_fun_s
+{
+    const char* name;
+    int num_arg;
+} python_operation_fun[] = {
+  /* Same order as the python_operation enum. */
+    {"__add__",2},      {"__radd__",2},     {"__iadd__",2},
+    {"__sub__",2},      {"__rsub__",2},     {"__isub__",2},
+    {"__mul__",2},      {"__rmul__",2},     {"__imul__",2},
+    {"__truediv__",2},  {"__rtruediv__",2}, {"__itruediv__",2},
+    {"__mod__",2},      {"__rmod__",2},     {"__imod__",2},
+    {"__lshift__",2},   {"__rlshift__",2},  {"__ilshift__",2},
+    {"__rshift__",2},   {"__rrshift__",2},  {"__irshift__",2},
+    {"__and__",2},      {"__rand__",2},     {"__iand__",2},
+    {"__or__",2},       {"__ror__",2},      {"__ior__",2},
+    {"__xor__",2},      {"__rxor__",2},     {"__ixor__",2},
+
+    {"__lt__",2},       {"__rlt__",2},
+    {"__le__",2},       {"__rle__",2},
+    {"__eq__",2},       {"__req__",2},
+    {"__ne__",2},       {"__rne__",2},
+    {"__gt__",2},       {"__rgt__",2},
+    {"__ge__",2},       {"__rge__",2},
+
+    {"__neg__",1},
+    {"__invert__",1},
+};
+
 static python_poll_fds_t *poll_fds = NULL;
   /* List of all via register_socket() registered file descriptors.
    */
@@ -218,6 +308,11 @@ static const char* python_hook_names[] = {
     "ON_OBJECT_CREATED",
     "ON_OBJECT_DESTRUCTED",
     "ON_CHILD_PROCESS_TERMINATED",
+    "ON_SIGINT",
+    "ON_SIGTERM",
+    "ON_SIGHUP",
+    "ON_SIGUSR1",
+    "ON_SIGUSR2",
 };
 
 static const char* lfun_flag_names[] = {
@@ -258,6 +353,10 @@ static ldmud_gc_var_t *gc_object_list = NULL,
                       *gc_symbol_list = NULL,
                       *gc_quoted_array_list = NULL,
                       *gc_lvalue_list = NULL;
+static ldmud_gc_lpctype_type_t *gc_lpctype_list = NULL;
+static ldmud_concrete_struct_type_t *gc_struct_type_list = NULL;
+
+static PyThreadState * thread_state = NULL;
 
 #ifdef USE_PYTHON_CONTEXT
 static PyObject * python_contextvar_current_object = NULL;
@@ -268,19 +367,158 @@ static PyObject * python_contextvar_command_giver = NULL;
 #endif
 
 /* -- Function prototypes --- */
+static bool ldmud_object_check(PyObject *ob);
 static PyObject* lpctype_to_pythontype(lpctype_t *type);
 static lpctype_t* pythontype_to_lpctype(PyObject* ptype);
+static PyObject* adapt_pythontype(PyObject *ptype);
+static string_t* python_string_to_string(PyObject* pstr);
 static const char* python_to_svalue(svalue_t *dest, PyObject* val);
 static PyObject* svalue_to_python(svalue_t *svp);
 static PyObject* rvalue_to_python(svalue_t *svp);
 static bool python_eq_svalue(PyObject* pval, svalue_t *sval);
 static bool call_lpc_secure(CClosureFun fun, int num_arg, void* data);
+static bool python_start_thread();
+static void python_finish_thread(bool started);
 static void python_save_context();
 static void python_clear_context();
 static void python_restore_context();
 
 /* -- Python definitions and functions --- */
 
+static void
+update_efun_info (python_efun_info_t *info, PyObject *fun)
+
+/* Fill out the <info> struct with information from <fun>.
+ * It is assumed that <fun> is a python callable.
+ */
+
+{
+    PyObject *annotations, *code, *property, *varnames, *returnname, *defaults;
+    lpctype_t **types;
+    long argcount, kwonlyargcount, flags;
+
+    info->types = NULL;
+    info->minarg = 0;
+    info->maxarg = 0;
+    info->varargs = true;
+    info->exists = true;
+
+    /* Let's check whether we have type information. */
+
+    /* We have only enough information for real functions. */
+    if (!PyFunction_Check(fun))
+        return;
+
+    /* First let's try to get the argument counts. */
+    code = PyFunction_GetCode(fun);
+    if (!code || !PyCode_Check(code))
+        return;
+
+    property = PyObject_GetAttrString(code, "co_argcount");
+    if (!property || !PyLong_Check(property))
+    {
+        Py_XDECREF(property);
+        PyErr_Clear();
+        return;
+    }
+    argcount = PyLong_AsLong(property);
+    Py_XDECREF(property);
+
+    property = PyObject_GetAttrString(code, "co_kwonlyargcount");
+    if (!property || !PyLong_Check(property))
+    {
+        Py_XDECREF(property);
+        PyErr_Clear();
+        return;
+    }
+    kwonlyargcount = PyLong_AsLong(property);
+    Py_XDECREF(property);
+
+    property = PyObject_GetAttrString(code, "co_flags");
+    if (!property || !PyLong_Check(property))
+    {
+        Py_XDECREF(property);
+        PyErr_Clear();
+        return;
+    }
+    flags = PyLong_AsLong(property);
+    Py_XDECREF(property);
+
+    info->minarg = (int)argcount;
+    info->maxarg = (int)argcount;
+    info->varargs = (flags & CO_VARARGS) ? true : false;
+
+    defaults = PyFunction_GetDefaults(fun);
+    if (defaults && PySequence_Check(defaults))
+        info->minarg -= (int)PySequence_Length(defaults);
+
+    /* And now look at annotations to get the types. */
+    annotations = PyFunction_GetAnnotations(fun);
+    if (!annotations || !PyMapping_Check(annotations))
+        return;
+
+    varnames = PyObject_GetAttrString(code, "co_varnames");
+    if (!varnames || !PySequence_Check(varnames))
+    {
+        Py_XDECREF(varnames);
+        PyErr_Clear();
+        return;
+    }
+
+    info->types = types = xalloc(sizeof(lpctype_t*) * (1 + argcount + ((flags & CO_VARARGS) ? 1 : 0)));
+    if (types == NULL)
+    {
+        Py_XDECREF(varnames);
+        return;
+    }
+
+    returnname = PyUnicode_FromString("return");
+    if (returnname)
+    {
+        PyObject* retanno = PyObject_GetItem(annotations, returnname);
+        if (retanno)
+            types[0] = pythontype_to_lpctype(retanno);
+        else
+        {
+            PyErr_Clear();
+            types[0] = NULL;
+        }
+
+        Py_XDECREF(retanno);
+        Py_DECREF(returnname);
+    }
+
+    for (long pos = 0; pos < argcount + ((flags & CO_VARARGS) ? 1 : 0); pos++)
+    {
+        PyObject* argname = PySequence_ITEM(varnames, pos == argcount ? argcount + kwonlyargcount : pos);
+        PyObject* arganno;
+        if (!argname || !PyUnicode_Check(argname))
+        {
+            PyErr_Clear();
+            Py_XDECREF(argname);
+            types[1 + pos] = NULL;
+            continue;
+        }
+
+        arganno = PyObject_GetItem(annotations, argname);
+        if (!arganno)
+        {
+            PyErr_Clear();
+            Py_DECREF(argname);
+            types[1 + pos] = NULL;
+            continue;
+        }
+
+        types[1 + pos] = pythontype_to_lpctype(arganno);
+
+        Py_DECREF(argname);
+        Py_DECREF(arganno);
+    }
+
+    Py_DECREF(varnames);
+} /* update_efun_info() */
+
+/*-------------------------------------------------------------------------*/
 static PyObject*
 python_register_efun (PyObject *module, PyObject *args, PyObject *kwds)
 
@@ -359,7 +597,7 @@ python_register_efun (PyObject *module, PyObject *args, PyObject *kwds)
 
         python_efun_entry = python_efun_table + idx;
         Py_XDECREF(python_efun_table[idx].callable);
-        xfree(python_efun_table[idx].types);
+        xfree(python_efun_table[idx].info.types);
     }
     else if(num_python_efun == PYTHON_EFUN_TABLE_SIZE)
     {
@@ -377,121 +615,7 @@ python_register_efun (PyObject *module, PyObject *args, PyObject *kwds)
 
     /* Update the efun table entry. */
     python_efun_entry->callable = fun;
-    python_efun_entry->types = NULL;
-    python_efun_entry->minarg = 0;
-    python_efun_entry->maxarg = 0;
-    python_efun_entry->varargs = true;
-
-    /* Let's check whether we have type information. */
-    do  /* A loop, so we can exit this block easily. */
-    {
-        PyObject *annotations, *code, *property, *varnames, *returnname, *defaults;
-        lpctype_t **types;
-        long argcount, kwonlyargcount, flags;
-
-        /* We have only enough information for real functions. */
-        if (!PyFunction_Check(fun))
-            break;
-
-        /* First let's try to get the argument counts. */
-        code = PyFunction_GetCode(fun);
-        if (!code || !PyCode_Check(code))
-            break;
-
-        property = PyObject_GetAttrString(code, "co_argcount");
-        if (!property || !PyLong_Check(property))
-        {
-            Py_XDECREF(property);
-            break;
-        }
-        argcount = PyLong_AsLong(property);
-        Py_XDECREF(property);
-
-        property = PyObject_GetAttrString(code, "co_kwonlyargcount");
-        if (!property || !PyLong_Check(property))
-        {
-            Py_XDECREF(property);
-            break;
-        }
-        kwonlyargcount = PyLong_AsLong(property);
-        Py_XDECREF(property);
-
-        property = PyObject_GetAttrString(code, "co_flags");
-        if (!property || !PyLong_Check(property))
-        {
-            Py_XDECREF(property);
-            break;
-        }
-        flags = PyLong_AsLong(property);
-        Py_XDECREF(property);
-
-        python_efun_entry->minarg = (int)argcount;
-        python_efun_entry->maxarg = (int)argcount;
-        python_efun_entry->varargs = (flags & CO_VARARGS) ? true : false;
-
-        defaults = PyFunction_GetDefaults(fun);
-        if (defaults && PySequence_Check(defaults))
-            python_efun_entry->minarg -= (int)PySequence_Length(defaults);
-
-        /* And now look at annotations to get the types. */
-        annotations = PyFunction_GetAnnotations(fun);
-        if (!annotations || !PyMapping_Check(annotations))
-            break;
-
-        varnames = PyObject_GetAttrString(code, "co_varnames");
-        if (!varnames || !PySequence_Check(varnames))
-        {
-            Py_XDECREF(varnames);
-            break;
-        }
-
-        python_efun_entry->types = types = xalloc(sizeof(lpctype_t*) * (1 + argcount + ((flags & CO_VARARGS) ? 1 : 0)));
-
-        returnname = PyUnicode_FromString("return");
-        if (returnname)
-        {
-            PyObject* retanno = PyObject_GetItem(annotations, returnname);
-            if (retanno)
-                types[0] = pythontype_to_lpctype(retanno);
-            else
-            {
-                PyErr_Clear();
-                types[0] = NULL;
-            }
-
-            Py_XDECREF(retanno);
-            Py_DECREF(returnname);
-        }
-
-        for (long pos = 0; pos < argcount + ((flags & CO_VARARGS) ? 1 : 0); pos++)
-        {
-            PyObject* argname = PySequence_ITEM(varnames, pos == argcount ? argcount + kwonlyargcount : pos);
-            PyObject* arganno;
-            if (!argname || !PyUnicode_Check(argname))
-            {
-                PyErr_Clear();
-                Py_XDECREF(argname);
-                types[1 + pos] = NULL;
-                continue;
-            }
-
-            arganno = PyObject_GetItem(annotations, argname);
-            if (!arganno)
-            {
-                PyErr_Clear();
-                Py_DECREF(argname);
-                types[1 + pos] = NULL;
-                continue;
-            }
-
-            types[1 + pos] = pythontype_to_lpctype(arganno);
-
-            Py_DECREF(argname);
-            Py_DECREF(arganno);
-        }
-
-        Py_DECREF(varnames);
-    } while (false);
+    update_efun_info(&(python_efun_entry->info), fun);
 
     Py_XINCREF(fun);
     Py_INCREF(Py_None);
@@ -545,14 +669,379 @@ python_unregister_efun (PyObject *module, PyObject *args, PyObject *kwds)
         int idx = ident->u.global.python_efun;
 
         Py_XDECREF(python_efun_table[idx].callable);
-        xfree(python_efun_table[idx].types);
+        xfree(python_efun_table[idx].info.types);
         python_efun_table[idx].callable = NULL;
-        python_efun_table[idx].types = NULL;
+        python_efun_table[idx].info.types = NULL;
     }
 
     Py_INCREF(Py_None);
     return Py_None;
 } /* python_unregister_efun() */
+
+/*-------------------------------------------------------------------------*/
+static void
+update_type_operation (python_type_entry_t* python_type_entry, enum python_operation op)
+
+/* Update the entry for the given operation on the python type.
+ *
+ * Look up the operation <op> in the Python type of <python_type_entry> and
+ * fill the entries for <op> accordingly.
+ */
+
+{
+    PyObject *fun, *code, *property, *defaults, *annotations, *returnname;
+    long argcount, kwonlyargcount, flags, min_arg, max_arg, num_arg;
+
+    python_type_entry->op[op].returntype = NULL;
+    python_type_entry->op[op].argtype = NULL;
+
+    fun = PyObject_GetAttrString(python_type_entry->pytype, python_operation_fun[op].name);
+    if (!fun || !PyCallable_Check(fun))
+    {
+        /* Not existing or not callable, handle it as non-existent. */
+        Py_XDECREF(fun);
+        PyErr_Clear();
+        return;
+    }
+    num_arg = python_operation_fun[op].num_arg;
+
+    /* Unless we know more specifics, we regard it as accepting
+     * mixed and returning mixed.
+     */
+    python_type_entry->op[op].returntype = lpctype_mixed;
+    if (num_arg > 1)
+        python_type_entry->op[op].argtype = lpctype_mixed;
+
+    if (!PyFunction_Check(fun))
+    {
+        /* This is not a regular function, so we cannot get any
+         * specific information about its declaration.
+         */
+        Py_DECREF(fun);
+        return;
+    }
+
+    code = PyFunction_GetCode(fun);
+    if (!code || !PyCode_Check(code))
+    {
+        /* Same as above. */
+        Py_DECREF(fun);
+        return;
+    }
+
+    /* These properties should exist, otherwise something's amiss. */
+    property = PyObject_GetAttrString(code, "co_argcount");
+    if (!property || !PyLong_Check(property))
+    {
+        Py_XDECREF(property);
+        Py_DECREF(fun);
+        PyErr_Clear();
+        return;
+    }
+    argcount = PyLong_AsLong(property);
+    Py_XDECREF(property);
+
+    property = PyObject_GetAttrString(code, "co_kwonlyargcount");
+    if (!property || !PyLong_Check(property))
+    {
+        Py_XDECREF(property);
+        Py_DECREF(fun);
+        PyErr_Clear();
+        return;
+    }
+    kwonlyargcount = PyLong_AsLong(property);
+    Py_XDECREF(property);
+
+    property = PyObject_GetAttrString(code, "co_flags");
+    if (!property || !PyLong_Check(property))
+    {
+        Py_XDECREF(property);
+        Py_DECREF(fun);
+        PyErr_Clear();
+        return;
+    }
+    flags = PyLong_AsLong(property);
+    Py_XDECREF(property);
+
+    min_arg = argcount;
+    max_arg = argcount;
+
+    defaults = PyFunction_GetDefaults(fun);
+    if (defaults && PySequence_Check(defaults))
+        min_arg -= PySequence_Length(defaults);
+    if ((flags & CO_VARARGS) != 0)
+    {
+        min_arg--;
+        max_arg+= num_arg;
+    }
+
+    if (num_arg < min_arg || num_arg > max_arg)
+    {
+        /* Calling it with <num_arg> arguments would result in an error,
+         * so ignoring this function.
+         */
+        python_type_entry->op[op].returntype = NULL;
+        python_type_entry->op[op].argtype = NULL;
+        Py_DECREF(fun);
+        return;
+    }
+
+    /* And now look at annotations to get the types. */
+    annotations = PyFunction_GetAnnotations(fun);
+    if (!annotations || !PyMapping_Check(annotations))
+    {
+        Py_DECREF(fun);
+        return;
+    }
+
+    returnname = PyUnicode_FromString("return");
+    if (returnname)
+    {
+        PyObject* retanno = PyObject_GetItem(annotations, returnname);
+        if (!retanno)
+            PyErr_Clear();
+        else
+        {
+            python_type_entry->op[op].returntype = pythontype_to_lpctype(retanno);
+            Py_DECREF(retanno);
+        }
+        Py_DECREF(returnname);
+    }
+
+    if (num_arg > 1)
+    {
+        PyObject *varnames = PyObject_GetAttrString(code, "co_varnames");
+        PyObject *argname, *arganno;
+
+        if (!varnames || !PySequence_Check(varnames))
+        {
+            Py_XDECREF(varnames);
+            Py_DECREF(fun);
+            PyErr_Clear();
+            return;
+        }
+
+        argname = PySequence_ITEM(varnames, argcount == 1 ? argcount + kwonlyargcount : 1);
+        if (!argname || !PyUnicode_Check(argname))
+        {
+            PyErr_Clear();
+            Py_XDECREF(argname);
+            Py_DECREF(varnames);
+            Py_DECREF(fun);
+            return;
+        }
+
+        arganno = PyObject_GetItem(annotations, argname);
+        if (!arganno)
+            PyErr_Clear();
+        else
+        {
+            python_type_entry->op[op].argtype = pythontype_to_lpctype(arganno);
+            Py_DECREF(arganno);
+        }
+        Py_DECREF(argname);
+        Py_DECREF(varnames);
+    }
+
+    Py_XDECREF(fun);
+} /* update_type_operation() */
+
+/*-------------------------------------------------------------------------*/
+static void
+update_type_efun_info (python_type_entry_t* python_type_entry, int efun_idx)
+
+/* Update the information for the given efun on the python type.
+ *
+ * Look up for an override of the efun <efun_idx> in the Python
+ * type of <python_type_entry> and fill the entries it accordingly.
+ */
+
+{
+    char funname[64];
+    PyObject *fun;
+    int efun_code;
+
+    python_type_entry->efun[efun_idx].exists = false;
+
+    if (efun_idx < EFUN_COUNT)
+        efun_code = EFUN_OFFSET + efun_idx;
+    else if (efun_idx < EFUN_COUNT + EFUN1_COUNT)
+        efun_code = EFUN1_OFFSET + efun_idx - EFUN_COUNT;
+    else if (efun_idx < EFUN_COUNT + EFUN1_COUNT + EFUN2_COUNT)
+        efun_code = EFUN2_OFFSET + efun_idx - EFUN_COUNT - EFUN1_COUNT;
+    else if (efun_idx < EFUN_COUNT + EFUN1_COUNT + EFUN2_COUNT + EFUN3_COUNT)
+        efun_code = EFUN3_OFFSET + efun_idx - EFUN_COUNT - EFUN1_COUNT - EFUN2_COUNT;
+    else if (efun_idx < EFUN_COUNT + EFUN1_COUNT + EFUN2_COUNT + EFUN3_COUNT + EFUN4_COUNT)
+        efun_code = EFUN4_OFFSET + efun_idx - EFUN_COUNT - EFUN1_COUNT - EFUN2_COUNT - EFUN3_COUNT;
+    else
+        efun_code = EFUNV_OFFSET + efun_idx - EFUN_COUNT - EFUN1_COUNT - EFUN2_COUNT - EFUN3_COUNT - EFUN4_COUNT;
+
+    snprintf(funname, sizeof(funname), "__efun_%s__", instrs[efun_code].name);
+    fun = PyObject_GetAttrString(python_type_entry->pytype, funname);
+
+    if (!fun || !PyCallable_Check(fun))
+    {
+        Py_XDECREF(fun);
+        PyErr_Clear();
+        return;
+    }
+
+    update_efun_info(python_type_entry->efun + efun_idx, fun);
+    Py_DECREF(fun);
+} /* update_type_efun_info() */
+
+/*-------------------------------------------------------------------------*/
+static PyObject*
+python_register_type (PyObject *module, PyObject *args, PyObject *kwds)
+
+/* Python function to register a python type for use in LPC.
+ *
+ * The callable is entered into the python_efun_table
+ * and its table index is saved as an identifier in the lexer
+ * (perhaps overriding an internal efun)
+ */
+
+{
+    static char *kwlist[] = { "name", "type", NULL};
+
+    char *name;
+    PyObject *class;
+    ident_t *ident;
+    python_type_entry_t* python_type_entry;
+
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "sO:register_type", kwlist, &name, &class))
+        return NULL;
+
+    if (!PyType_Check(class))
+    {
+        PyErr_SetString(PyExc_TypeError, "type parameter must be a type");
+        return NULL;
+    }
+
+    ident = make_shared_identifier(name, I_TYPE_PYTHON_TYPE, 0);
+    if (!ident)
+    {
+        PyErr_SetString(PyExc_MemoryError, "out of memory");
+        return NULL;
+    }
+
+    if (ident->type == I_TYPE_UNKNOWN)
+    {
+        if(num_python_type == PYTHON_TYPE_TABLE_SIZE)
+        {
+            free_shared_identifier(ident);
+            PyErr_SetString(PyExc_RuntimeError, "too many types registered");
+            return NULL;
+        }
+        else
+        {
+            ident->type = I_TYPE_PYTHON_TYPE;
+            ident->u.python_type_id = (unsigned short) num_python_type;
+            ident->next_all = all_python_types;
+            all_python_types = ident;
+
+            python_type_entry = python_type_table[num_python_type] = xalloc(sizeof(python_type_entry_t));
+            if (python_type_entry == NULL)
+            {
+                free_shared_identifier(ident);
+                PyErr_SetString(PyExc_MemoryError, "out of memory");
+                return NULL;
+            }
+
+            python_type_entry->lpctype = NULL;
+            python_type_entry->name = ident;
+            num_python_type++;
+        }
+    }
+    else if (ident->type == I_TYPE_PYTHON_TYPE)
+    {
+        /* Already registered? Reuse the entry. */
+        python_type_entry = python_type_table[ident->u.python_type_id];
+        assert(python_type_entry != NULL);
+
+        Py_XDECREF(python_type_entry->pytype);
+
+        for (int i = 0; i < PYTHON_OPERATIONS_COUNT; i++)
+        {
+            free_lpctype(python_type_entry->op[i].returntype);
+            free_lpctype(python_type_entry->op[i].argtype);
+        }
+
+        for (int i = 0; i < REAL_EFUN_COUNT; i++)
+            xfree(python_type_entry->efun[i].types);
+    }
+    else
+    {
+        /* There is higher level identifier?
+         * Must be a permanent define, which is forbidden.
+         */
+        PyErr_SetString(PyExc_RuntimeError, "couldn't create type entry");
+        return NULL;
+    }
+
+    /* Update the type table entry. */
+    Py_XINCREF(class);
+    python_type_entry->pytype = class;
+    for (int i = 0; i < PYTHON_OPERATIONS_COUNT; i++)
+        update_type_operation(python_type_entry, i);
+    for (int i = 0; i < REAL_EFUN_COUNT; i++)
+        update_type_efun_info(python_type_entry, i);
+
+    PyErr_Clear();
+
+    Py_INCREF(Py_None);
+    return Py_None;
+} /* python_register_type() */
+
+/*-------------------------------------------------------------------------*/
+static PyObject*
+python_unregister_type (PyObject *module, PyObject *args, PyObject *kwds)
+
+/* Python function to remove a type registration.
+ * We just set the .pytype entry in the python_type_table to NULL.
+ * The identifier stays, because we want to reuse its index,
+ * when this type will be re-registered.
+ *
+ * Existing code and values will still work, but Python code can't return
+ * this type anymore.
+ */
+
+{
+    static char *kwlist[] = { "name", NULL};
+
+    char *name;
+    ident_t *ident;
+
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "s:unregister_efun", kwlist, &name))
+        return NULL;
+
+    ident = find_shared_identifier(name, I_TYPE_PYTHON_TYPE, 0);
+    if (!ident || ident->type == I_TYPE_UNKNOWN)
+    {
+        /* No identifier there, we're done. */
+        Py_INCREF(Py_None);
+        return Py_None;
+    }
+
+    /* There is higher level identifier?
+     * Must be a permanent define, which is forbidden.
+     */
+    if (ident->type != I_TYPE_PYTHON_TYPE)
+    {
+        PyErr_SetString(PyExc_RuntimeError, "couldn't remove type entry");
+        return NULL;
+    }
+    else
+    {
+        int idx = ident->u.python_type_id;
+
+        Py_XDECREF(python_type_table[idx]->pytype);
+        python_type_table[idx]->pytype = NULL;
+    }
+
+    Py_INCREF(Py_None);
+    return Py_None;
+} /* python_unregister_type() */
 
 /*-------------------------------------------------------------------------*/
 static PyObject*
@@ -769,6 +1258,35 @@ struct ldmud_gc_var_s
 
 #define PyGCObject_HEAD ldmud_gc_var_t gcob_base;
 
+typedef struct ldmud_lpctype_s ldmud_lpctype_t;
+typedef lpctype_t * (*lpctype_factory)(ldmud_lpctype_t*);
+
+struct ldmud_lpctype_s
+{
+    PyTypeObject type_base;
+    lpctype_factory get_lpctype;
+};
+
+struct ldmud_gc_lpctype_type_s
+{
+    struct ldmud_lpctype_s ldmud_lpctype;
+    lpctype_t *type;
+    ldmud_gc_lpctype_type_t *gcprev, *gcnext;
+};
+
+struct ldmud_concrete_array_type_s
+{
+    struct ldmud_lpctype_s ldmud_lpctype;
+    struct ldmud_lpctype_s* element_type;
+};
+
+struct ldmud_concrete_struct_type_s
+{
+    struct ldmud_lpctype_s ldmud_lpctype;
+    struct_name_t *name;
+    ldmud_concrete_struct_type_t *gcprev, *gcnext;
+};
+
 struct ldmud_array_s
 {
     PyGCObject_HEAD
@@ -871,6 +1389,8 @@ struct ldmud_lvalue_s
     svalue_t lpc_lvalue;        /* Can be T_INVALID. */
 };
 
+typedef struct ldmud_lpctype_s ldmud_lpctype_t;
+typedef struct ldmud_concrete_array_type_s ldmud_concrete_array_type_t;
 typedef struct ldmud_array_s ldmud_array_t;
 typedef struct ldmud_mapping_s ldmud_mapping_t;
 typedef struct ldmud_struct_s ldmud_struct_t;
@@ -889,6 +1409,72 @@ typedef struct ldmud_lvalue_s ldmud_lvalue_t;
 /*-------------------------------------------------------------------------*/
 /* GC Support */
 
+static INLINE void
+internal_add_gc_object (void** list, void* var, size_t gcprev_offset, size_t gcnext_offset)
+
+/* Add <var> to the <list>.
+ * <gcprev_offset> and <gcnext_offset> are offsets for member
+ * variables gcprev/gcnext in <var>'s struct.
+ */
+
+{
+    *(void**)(var + gcnext_offset) = *list;
+    *(void**)(var + gcprev_offset) = NULL;
+
+    if(*list != NULL)
+    {
+        assert(*(void**)(*list + gcprev_offset) == NULL);
+        *(void**)(*list + gcprev_offset) = var;
+    }
+    *list = var;
+
+    num_python_lpc_references++;
+} /* internal_add_gc_object() */
+
+#define ADD_GC_OBJECT(list, var) do { \
+        void *l = list;               \
+        internal_add_gc_object(&l, var, (char*)&(var->gcprev) - (char*)var, (char*)&(var->gcnext) - (char*)var); \
+        list = l;                     \
+    } while(0);
+/*-------------------------------------------------------------------------*/
+static INLINE void
+internal_remove_gc_object (void** list, void* var, size_t gcprev_offset, size_t gcnext_offset)
+
+/* Remove <var> from the <list>.
+ */
+
+{
+    void* prev = *(void**)(var + gcprev_offset);
+    void* next = *(void**)(var + gcnext_offset);
+
+    if (prev == NULL)
+    {
+        /* List start */
+        assert(*list == var);
+
+        *list = next;
+    }
+    else
+    {
+        assert(*(void**)(prev + gcnext_offset) == var);
+        *(void**)(prev + gcnext_offset) = next;
+    }
+
+    if(next)
+    {
+        assert(*(void**)(next + gcprev_offset) == var);
+        *(void**)(next + gcprev_offset) = prev;
+    }
+
+    num_python_lpc_references--;
+} /* internal_remove_gc_object() */
+
+#define REMOVE_GC_OBJECT(list, var) do { \
+        void *l = list;                  \
+        internal_remove_gc_object(&l, var, (char*)&(var->gcprev) - (char*)var, (char*)&(var->gcnext) - (char*)var); \
+        list = l;                        \
+    } while(0);
+/*-------------------------------------------------------------------------*/
 static void
 add_gc_object (ldmud_gc_var_t** list, ldmud_gc_var_t* var)
 
@@ -896,14 +1482,7 @@ add_gc_object (ldmud_gc_var_t** list, ldmud_gc_var_t* var)
  */
 
 {
-    var->gcnext = *list;
-    var->gcprev = NULL;
-    if(*list != NULL)
-    {
-        assert((*list)->gcprev == NULL);
-        (*list)->gcprev = var;
-    }
-    *list = var;
+    ADD_GC_OBJECT(*list, var);
 } /* add_gc_object() */
 
 /*-------------------------------------------------------------------------*/
@@ -914,22 +1493,7 @@ remove_gc_object (ldmud_gc_var_t** list, ldmud_gc_var_t* var)
  */
 
 {
-    if (var->gcprev == NULL)
-    {
-        /* List start */
-        assert(*list == var);
-
-        *list = var->gcnext;
-        if(*list)
-            (*list)->gcprev = NULL;
-    }
-    else
-    {
-        assert(var->gcprev->gcnext == var);
-        var->gcprev->gcnext = var->gcnext;
-        if(var->gcnext)
-            var->gcnext->gcprev = var->gcprev;
-    }
+    REMOVE_GC_OBJECT(*list, var);
 } /* remove_gc_object() */
 
 /*-------------------------------------------------------------------------*/
@@ -1015,6 +1579,1846 @@ find_tabled_python_string (PyObject* name, const char *msg, bool *error)
 } /* find_tabled_python_string() */
 
 /*-------------------------------------------------------------------------*/
+static PyObject*
+pointer_richcompare (void *arg1, void *arg2, int op)
+
+/* Compare <arg1> against <arg2> with the compare operation <op>.
+ */
+
+{
+    bool result;
+    PyObject *resultval;
+
+    /* Need to treat NULL specially as < or > comparisons between
+     * NULL and non-NULL pointers are not defined.
+     */
+    if(arg1 == NULL && arg2 == NULL)
+        result = op == Py_LE || op == Py_EQ || op == Py_GE;
+    else if(arg1 == NULL)
+        result = op == Py_LT || op == Py_LE || op == Py_NE;
+    else if(arg2 == NULL)
+        result = op == Py_GT || op == Py_GE || op == Py_NE;
+    else
+        Py_RETURN_RICHCOMPARE(arg1, arg2, op);
+
+    resultval = result ? Py_True : Py_False;
+    Py_INCREF(resultval);
+    return resultval;
+} /* pointer_richcompare() */
+
+/*-------------------------------------------------------------------------*/
+static PyObject *
+object_mro (PyTypeObject *self)
+
+/* This is for non-instantiable types to prevent cyclic references in the mro.
+ * This function will return an tuple with the object type as the mro.
+ */
+
+{
+    Py_INCREF(&PyBaseObject_Type);
+    return PyTuple_Pack(1, &PyBaseObject_Type);
+} /* object_mro() */
+
+/*-------------------------------------------------------------------------*/
+/* LPC type */
+
+/*-------------------------------------------------------------------------*/
+static PyObject*
+ldmud_lpctype_or (PyObject* first, PyObject* second)
+
+/* Create a union type of both arguments.
+ */
+
+{
+    lpctype_t *t1 = pythontype_to_lpctype(first), *t2 = pythontype_to_lpctype(second);
+    lpctype_t *t;
+    PyObject *result;
+
+    if (t1 == NULL || t2 == NULL)
+    {
+        free_lpctype(t1);
+        free_lpctype(t2);
+
+        Py_INCREF(Py_NotImplemented);
+        return Py_NotImplemented;
+    }
+
+    t = get_union_type(t1, t2);
+    free_lpctype(t1);
+    free_lpctype(t2);
+
+    result = lpctype_to_pythontype(t);
+    free_lpctype(t);
+
+    if (result == NULL)
+    {
+        Py_INCREF(Py_NotImplemented);
+        return Py_NotImplemented;
+    }
+    return result;
+} /* ldmud_lpctype_or() */
+
+/*-------------------------------------------------------------------------*/
+static int
+ldmud_lpctype_contains (ldmud_lpctype_t *self, PyObject *val)
+
+/* Check whether <val> is contained in <self>.
+ */
+
+{
+    lpctype_t *member = pythontype_to_lpctype(val);
+    int result = 0;
+
+    if (member)
+    {
+        lpctype_t *con = (*self->get_lpctype)(self);
+
+        result = lpctype_contains(member, con) ? 1 : 0;
+        free_lpctype(con);
+        free_lpctype(member);
+    }
+
+    return result;
+} /* ldmud_lpctype_contains() */
+
+/*-------------------------------------------------------------------------*/
+static PyObject*
+ldmud_lpctype_new (PyTypeObject *type, PyObject *args, PyObject *kwds)
+
+/* Implmenent __new__ for ldmud_lpctype_t. This is a No-Op for any
+ * argument that is already an lpc type. For other types we try to
+ * convert. This is basically doing
+ * lpctype_to_pythontype(pythontype_to_lpctype(arg)).
+ */
+
+{
+    static char *kwlist[] = { "type", NULL};
+
+    PyObject *value;
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "O", kwlist, &value))
+        return NULL;
+
+    return adapt_pythontype(value);
+} /* ldmud_lpctype_new() */
+
+/*-------------------------------------------------------------------------*/
+static lpctype_t*
+ldmud_lpctype_get_lpctype (ldmud_lpctype_t* type)
+
+/* Return the lpctype for ldmud.LPCType.
+ */
+
+{
+    return lpctype_lpctype;
+} /* ldmud_lpctype_get_lpctype() */
+
+/*-------------------------------------------------------------------------*/
+static PyNumberMethods ldmud_lpctype_as_number =
+{
+    0,                                  /* nb_add */
+    0,                                  /* nb_subtract */
+    0,                                  /* nb_multiply */
+    0,                                  /* nb_remainder */
+    0,                                  /* nb_divmod */
+    0,                                  /* nb_power */
+    0,                                  /* nb_negative */
+    0,                                  /* nb_positive */
+    0,                                  /* nb_absolute */
+    0,                                  /* nb_bool */
+    0,                                  /* nb_invert */
+    0,                                  /* nb_lshift */
+    0,                                  /* nb_rshift */
+    0,                                  /* nb_and */
+    0,                                  /* nb_xor */
+    ldmud_lpctype_or,                   /* nb_or */
+};
+
+static PySequenceMethods ldmud_lpctype_as_sequence = {
+    0,                                  /* sq_length */
+    0,                                  /* sq_concat */
+    0,                                  /* sq_repeat */
+    0,                                  /* sq_item */
+    0,                                  /* sq_slice */
+    0,                                  /* sq_ass_item */
+    0,                                  /* sq_ass_slice */
+    (objobjproc)ldmud_lpctype_contains, /* sq_contains */
+    0,                                  /* sq_inplace_concat */
+    0,                                  /* sq_inplace_repeat */
+};
+
+static ldmud_lpctype_t ldmud_lpctype_type =
+{{
+    PyVarObject_HEAD_INIT(&ldmud_lpctype_type.type_base, 0)
+    "ldmud.LPCType",                    /* tp_name */
+    sizeof(ldmud_lpctype_t),            /* tp_basicsize */
+    0,                                  /* tp_itemsize */
+    0,                                  /* tp_dealloc */
+    0,                                  /* tp_print */
+    0,                                  /* tp_getattr */
+    0,                                  /* tp_setattr */
+    0,                                  /* tp_reserved */
+    0,                                  /* tp_repr */
+    &ldmud_lpctype_as_number,           /* tp_as_number */
+    &ldmud_lpctype_as_sequence,         /* tp_as_sequence */
+    0,                                  /* tp_as_mapping */
+    0,                                  /* tp_hash  */
+    0,                                  /* tp_call */
+    0,                                  /* tp_str */
+    0,                                  /* tp_getattro */
+    0,                                  /* tp_setattro */
+    0,                                  /* tp_as_buffer */
+    Py_TPFLAGS_DEFAULT|Py_TPFLAGS_TYPE_SUBCLASS, /* tp_flags */
+    "LPC type",                         /* tp_doc */
+    0,                                  /* tp_traverse */
+    0,                                  /* tp_clear */
+    0,                                  /* tp_richcompare */
+    0,                                  /* tp_weaklistoffset */
+    0,                                  /* tp_iter */
+    0,                                  /* tp_iternext */
+    0,                                  /* tp_methods */
+    0,                                  /* tp_members */
+    0,                                  /* tp_getset */
+    &PyType_Type,                       /* tp_base */
+    0,                                  /* tp_dict */
+    0,                                  /* tp_descr_get */
+    0,                                  /* tp_descr_set */
+    0,                                  /* tp_dictoffset */
+    0,                                  /* tp_init */
+    0,                                  /* tp_alloc */
+    ldmud_lpctype_new,                  /* tp_new */
+},  ldmud_lpctype_get_lpctype           /* get_lpctype */
+};
+
+/*-------------------------------------------------------------------------*/
+/* LPC union type. */
+
+static bool ldmud_union_type_check(PyObject *ob);
+static PyObject* ldmud_union_type_new(PyTypeObject *type, PyObject *args, PyObject *kwds);
+
+/*-------------------------------------------------------------------------*/
+static void
+add_gc_lpctype_object (ldmud_gc_lpctype_type_t* ob)
+
+/* Add <var> to the <list>.
+ */
+
+{
+    ADD_GC_OBJECT(gc_lpctype_list, ob);
+} /* add_gc_object() */
+
+/*-------------------------------------------------------------------------*/
+static void
+remove_gc_lpctype_object (ldmud_gc_lpctype_type_t* ob)
+
+/* Remove <var> from the <list>.
+ */
+
+{
+    REMOVE_GC_OBJECT(gc_lpctype_list, ob);
+} /* remove_gc_object() */
+
+/*-------------------------------------------------------------------------*/
+static void
+ldmud_lpctype_type_dealloc (ldmud_gc_lpctype_type_t* self)
+
+/* Destroy the ldmud_gc_lpctype_type_t object
+ */
+
+{
+    free_lpctype(self->type);
+
+    remove_gc_lpctype_object(self);
+
+    Py_XDECREF(self->ldmud_lpctype.type_base.tp_base);
+    Py_XDECREF(self->ldmud_lpctype.type_base.tp_dict);
+    Py_XDECREF(self->ldmud_lpctype.type_base.tp_bases);
+    Py_XDECREF(self->ldmud_lpctype.type_base.tp_mro);
+    Py_XDECREF(self->ldmud_lpctype.type_base.tp_cache);
+    Py_XDECREF(self->ldmud_lpctype.type_base.tp_subclasses);
+
+    Py_TYPE(self)->tp_free((PyObject*)self);
+} /* ldmud_lpctype_type_dealloc() */
+
+/*-------------------------------------------------------------------------*/
+static Py_hash_t
+ldmud_lpctype_type_hash (ldmud_gc_lpctype_type_t *type)
+
+/* Return a hash of this lpctype.
+ */
+
+{
+    return _Py_HashPointer(type->type);
+} /* ldmud_lpctype_type_hash() */
+
+/*-------------------------------------------------------------------------*/
+static lpctype_t *
+ldmud_lpctype_type_get_lpctype(ldmud_gc_lpctype_type_t *type)
+
+/* Create the LPC type object for the Python type.
+ */
+
+{
+    return ref_lpctype(type->type);
+} /* ldmud_lpctype_type_get_lpctype() */
+
+/*-------------------------------------------------------------------------*/
+static PyObject*
+ldmud_union_type_repr (ldmud_gc_lpctype_type_t *type)
+
+/* Return a string representation for this union type.
+ */
+
+{
+    return PyUnicode_FromFormat("ldmud.UnionType(%s)", get_lpctype_name(type->type));
+} /* ldmud_union_type_repr() */
+
+/*-------------------------------------------------------------------------*/
+static PyObject*
+ldmud_union_type_richcompare (ldmud_gc_lpctype_type_t *self, PyObject *other, int op)
+
+/* Compare <self> to <other> with the compare operation <op>.
+ */
+
+{
+    if (!ldmud_union_type_check(other))
+        Py_RETURN_NOTIMPLEMENTED;
+
+    return pointer_richcompare(self->type, ((ldmud_gc_lpctype_type_t*)other)->type, op);
+} /* ldmud_union_type_richcompare() */
+
+/*-------------------------------------------------------------------------*/
+static PyObject *
+ldmud_union_type_iter_next (ldmud_gc_lpctype_type_t* self)
+
+/* Return the next value for this iterator and update the iterator.
+ */
+
+{
+    if (!self->type)
+        return NULL;
+
+    if (self->type->t_class == TCLASS_UNION)
+    {
+        lpctype_t * old = self->type;
+        PyObject * result = lpctype_to_pythontype(self->type->t_union.member);
+        if (!result)
+            PyErr_Format(PyExc_TypeError, "unsupported lpctype [%s]", get_lpctype_name(self->type->t_union.member));
+
+        self->type = ref_lpctype(self->type->t_union.head);
+        free_lpctype(old);
+
+        return result;
+    }
+    else
+    {
+        PyObject * result = lpctype_to_pythontype(self->type);
+        if (!result)
+            PyErr_Format(PyExc_TypeError, "unsupported lpctype [%s]", get_lpctype_name(self->type));
+
+        free_lpctype(self->type);
+        self->type = NULL;
+
+        return result;
+    }
+} /* ldmud_union_type_iter_next() */
+
+/*-------------------------------------------------------------------------*/
+static PyTypeObject ldmud_union_type_iter_type =
+{
+    PyVarObject_HEAD_INIT(NULL, 0)
+    "ldmud.UnionTypeIter",              /* tp_name */
+    sizeof(ldmud_gc_lpctype_type_t),    /* tp_basicsize */
+    0,                                  /* tp_itemsize */
+    (destructor)ldmud_lpctype_type_dealloc, /* tp_dealloc */
+    0,                                  /* tp_print */
+    0,                                  /* tp_getattr */
+    0,                                  /* tp_setattr */
+    0,                                  /* tp_reserved */
+    0,                                  /* tp_repr */
+    0,                                  /* tp_as_number */
+    0,                                  /* tp_as_sequence */
+    0,                                  /* tp_as_mapping */
+    0,                                  /* tp_hash  */
+    0,                                  /* tp_call */
+    0,                                  /* tp_str */
+    0,                                  /* tp_getattro */
+    0,                                  /* tp_setattro */
+    0,                                  /* tp_as_buffer */
+    Py_TPFLAGS_DEFAULT,                 /* tp_flags */
+    "LPC union type iterator",          /* tp_doc */
+    0,                                  /* tp_traverse */
+    0,                                  /* tp_clear */
+    0,                                  /* tp_richcompare */
+    0,                                  /* tp_weaklistoffset */
+    PyObject_SelfIter,                  /* tp_iter */
+    (iternextfunc)ldmud_union_type_iter_next, /* tp_iternext */
+    0,                                  /* tp_methods */
+    0,                                  /* tp_members */
+    0,                                  /* tp_getset */
+    0,                                  /* tp_base */
+    0,                                  /* tp_dict */
+    0,                                  /* tp_descr_get */
+    0,                                  /* tp_descr_set */
+    0,                                  /* tp_dictoffset */
+    0,                                  /* tp_init */
+    0,                                  /* tp_alloc */
+    0,                                  /* tp_new */
+};
+
+/*-------------------------------------------------------------------------*/
+static PyObject *
+ldmud_union_type_iter (ldmud_gc_lpctype_type_t* self)
+
+/* Create an iterator for the union type.
+ */
+
+{
+    ldmud_gc_lpctype_type_t *result = (ldmud_gc_lpctype_type_t*)ldmud_union_type_iter_type.tp_alloc(&ldmud_union_type_iter_type, 0);
+    if (result == NULL)
+        return NULL;
+
+    result->type = ref_lpctype(self->type);
+
+    add_gc_lpctype_object(result);
+
+    return (PyObject*)result;
+} /* ldmud_union_type_iter() */
+
+/*-------------------------------------------------------------------------*/
+static PyMethodDef ldmud_union_type_type_methods[] =
+{
+    {
+        "mro",
+        (PyCFunction) object_mro, METH_NOARGS,
+        "mro() -> tuple\n\n"
+        "Return the method resolution order."
+    },
+    {NULL}
+};
+
+static PyTypeObject ldmud_union_type_type =
+{
+    PyVarObject_HEAD_INIT(NULL, 0)
+    "ldmud.UnionType",                  /* tp_name */
+    sizeof(ldmud_gc_lpctype_type_t),    /* tp_basicsize */
+    0,                                  /* tp_itemsize */
+    (destructor)ldmud_lpctype_type_dealloc, /* tp_dealloc */
+    0,                                  /* tp_print */
+    0,                                  /* tp_getattr */
+    0,                                  /* tp_setattr */
+    0,                                  /* tp_reserved */
+    (reprfunc)ldmud_union_type_repr,    /* tp_repr */
+    0,                                  /* tp_as_number */
+    0,                                  /* tp_as_sequence */
+    0,                                  /* tp_as_mapping */
+    (hashfunc)ldmud_lpctype_type_hash,  /* tp_hash  */
+    0,                                  /* tp_call */
+    0,                                  /* tp_str */
+    0,                                  /* tp_getattro */
+    0,                                  /* tp_setattro */
+    0,                                  /* tp_as_buffer */
+    Py_TPFLAGS_DEFAULT|Py_TPFLAGS_TYPE_SUBCLASS, /* tp_flags */
+    "LPC union type",                   /* tp_doc */
+    0,                                  /* tp_traverse */
+    0,                                  /* tp_clear */
+    (richcmpfunc)ldmud_union_type_richcompare, /* tp_richcompare */
+    0,                                  /* tp_weaklistoffset */
+    (getiterfunc)ldmud_union_type_iter, /* tp_iter */
+    0,                                  /* tp_iternext */
+    ldmud_union_type_type_methods,      /* tp_methods */
+    0,                                  /* tp_members */
+    0,                                  /* tp_getset */
+    &ldmud_lpctype_type.type_base,      /* tp_base */
+    0,                                  /* tp_dict */
+    0,                                  /* tp_descr_get */
+    0,                                  /* tp_descr_set */
+    0,                                  /* tp_dictoffset */
+    0,                                  /* tp_init */
+    0,                                  /* tp_alloc */
+    0,                                  /* tp_new */
+};
+
+/*-------------------------------------------------------------------------*/
+static bool
+ldmud_union_type_check (PyObject *ob)
+
+/* Returns true, when <ob> is a concrete LPC array type.
+ */
+
+{
+    return Py_TYPE(ob) == &ldmud_union_type_type;
+} /* ldmud_union_type_check() */
+
+/*-------------------------------------------------------------------------*/
+static PyObject*
+ldmud_union_type_new (PyTypeObject *type, PyObject *args, PyObject *kwds)
+
+/* Just prevent creating an instance of this type.
+ */
+
+{
+    PyErr_SetString(PyExc_TypeError, "cannot create instances of a union type");
+    return NULL;
+} /* ldmud_union_type_new() */
+
+/*-------------------------------------------------------------------------*/
+static PyObject*
+ldmud_union_type_create (lpctype_t* type)
+
+/* Create a union type for <type>. <type> is assumed to be a union type.
+ * This type class is never really used as a Python class type.
+ * The reference of <type> is adopted.
+ */
+
+{
+    ldmud_gc_lpctype_type_t *result;
+
+    result = (ldmud_gc_lpctype_type_t*) ldmud_union_type_type.tp_alloc(&ldmud_union_type_type, 0);
+    if (result == NULL)
+    {
+        free_lpctype(type);
+        return NULL;
+    }
+
+    result->ldmud_lpctype.type_base.tp_name = "ldmud.Union";
+    result->ldmud_lpctype.type_base.tp_doc = "LPC union";
+    result->ldmud_lpctype.type_base.tp_basicsize = sizeof(PyObject);
+    result->ldmud_lpctype.type_base.tp_base = &PyBaseObject_Type;
+    result->ldmud_lpctype.type_base.tp_flags = Py_TPFLAGS_DEFAULT|Py_TPFLAGS_TYPE_SUBCLASS|Py_TPFLAGS_HEAPTYPE
+#ifdef Py_TPFLAGS_DISALLOW_INSTANTIATION
+                                             | Py_TPFLAGS_DISALLOW_INSTANTIATION
+#endif
+                                             ;
+    result->ldmud_lpctype.type_base.tp_new = ldmud_union_type_new;
+    result->ldmud_lpctype.get_lpctype = (lpctype_factory)ldmud_lpctype_type_get_lpctype;
+    result->type = type;
+    Py_INCREF(&PyBaseObject_Type);
+
+    add_gc_lpctype_object(result);
+
+    if (PyType_Ready(&result->ldmud_lpctype.type_base) < 0)
+    {
+        Py_DECREF(result);
+        return NULL;
+    }
+
+#ifndef Py_TPFLAGS_DISALLOW_INSTANTIATION
+    if (result->ldmud_lpctype.type_base.tp_dict != NULL)
+    {
+        /* Remove the __new__ function. */
+        if (PyDict_DelItemString(result->ldmud_lpctype.type_base.tp_dict, "__new__"))
+            PyErr_Clear();
+    }
+#endif
+
+    return (PyObject*)result;
+} /* ldmud_union_type_create() */
+
+/*-------------------------------------------------------------------------*/
+/* LPC array type. */
+
+static bool ldmud_concrete_array_type_check(PyObject *ob);
+static PyObject* ldmud_concrete_array_new(PyTypeObject *type, PyObject *args, PyObject *kwds);
+
+/*-------------------------------------------------------------------------*/
+static void
+ldmud_concrete_array_type_dealloc (ldmud_concrete_array_type_t* self)
+
+/* Destroy the ldmud_concrete_array_type_t object
+ */
+
+{
+    Py_XDECREF(self->element_type);
+    Py_XDECREF(self->ldmud_lpctype.type_base.tp_base);
+    Py_XDECREF(self->ldmud_lpctype.type_base.tp_dict);
+    Py_XDECREF(self->ldmud_lpctype.type_base.tp_bases);
+    Py_XDECREF(self->ldmud_lpctype.type_base.tp_mro);
+    Py_XDECREF(self->ldmud_lpctype.type_base.tp_cache);
+    Py_XDECREF(self->ldmud_lpctype.type_base.tp_subclasses);
+
+    Py_TYPE(self)->tp_free((PyObject*)self);
+} /* ldmud_concrete_array_type_dealloc() */
+
+/*-------------------------------------------------------------------------*/
+static PyObject*
+ldmud_concrete_array_type_repr (ldmud_concrete_array_type_t *type)
+
+/* Return a string representation for this array type.
+ */
+
+{
+    return PyUnicode_FromFormat("ldmud.Array[%R]", type->element_type);
+} /* ldmud_concrete_array_type_repr() */
+
+/*-------------------------------------------------------------------------*/
+static Py_hash_t
+ldmud_concrete_array_type_hash (ldmud_concrete_array_type_t *type)
+
+/* Return a hash of this concrete array type.
+ */
+
+{
+    return PyObject_Hash((PyObject*)type->element_type);
+} /* ldmud_concrete_array_type_hash() */
+
+/*-------------------------------------------------------------------------*/
+static PyObject*
+ldmud_concrete_array_type_richcompare (ldmud_concrete_array_type_t *self, PyObject *other, int op)
+
+/* Compare <self> to <other> with the compare operation <op>.
+ */
+
+{
+    if (!ldmud_concrete_array_type_check(other))
+        Py_RETURN_NOTIMPLEMENTED;
+
+    return PyObject_RichCompare((PyObject*)self->element_type,
+                                (PyObject*)((ldmud_concrete_array_type_t*)other)->element_type, op);
+} /* ldmud_concrete_array_type_richcompare() */
+
+/*-------------------------------------------------------------------------*/
+static lpctype_t *
+ldmud_concrete_array_get_lpctype(ldmud_concrete_array_type_t *type)
+
+/* Create the LPC type object for the Python type.
+ */
+
+{
+    lpctype_t *elem = (*type->element_type->get_lpctype)(type->element_type);
+    lpctype_t *result = get_array_type(elem);
+    free_lpctype(elem);
+    return result;
+} /* ldmud_concrete_array_get_lpctype() */
+
+/*-------------------------------------------------------------------------*/
+static PyMethodDef ldmud_concrete_array_type_type_methods[] =
+{
+    {
+        "mro",
+        (PyCFunction) object_mro, METH_NOARGS,
+        "mro() -> tuple\n\n"
+        "Return the method resolution order."
+    },
+    {NULL}
+};
+
+static PyTypeObject ldmud_concrete_array_type_type =
+{
+    PyVarObject_HEAD_INIT(NULL, 0)
+    "ldmud.ArrayType",                  /* tp_name */
+    sizeof(ldmud_concrete_array_type_t),/* tp_basicsize */
+    0,                                  /* tp_itemsize */
+    (destructor)ldmud_concrete_array_type_dealloc, /* tp_dealloc */
+    0,                                  /* tp_print */
+    0,                                  /* tp_getattr */
+    0,                                  /* tp_setattr */
+    0,                                  /* tp_reserved */
+    (reprfunc)ldmud_concrete_array_type_repr, /* tp_repr */
+    0,                                  /* tp_as_number */
+    0,                                  /* tp_as_sequence */
+    0,                                  /* tp_as_mapping */
+    (hashfunc)ldmud_concrete_array_type_hash, /* tp_hash  */
+    0,                                  /* tp_call */
+    0,                                  /* tp_str */
+    0,                                  /* tp_getattro */
+    0,                                  /* tp_setattro */
+    0,                                  /* tp_as_buffer */
+    Py_TPFLAGS_DEFAULT|Py_TPFLAGS_TYPE_SUBCLASS, /* tp_flags */
+    "LPC array type",                   /* tp_doc */
+    0,                                  /* tp_traverse */
+    0,                                  /* tp_clear */
+    (richcmpfunc)ldmud_concrete_array_type_richcompare, /* tp_richcompare */
+    0,                                  /* tp_weaklistoffset */
+    0,                                  /* tp_iter */
+    0,                                  /* tp_iternext */
+    ldmud_concrete_array_type_type_methods, /* tp_methods */
+    0,                                  /* tp_members */
+    0,                                  /* tp_getset */
+    &ldmud_lpctype_type.type_base,      /* tp_base */
+    0,                                  /* tp_dict */
+    0,                                  /* tp_descr_get */
+    0,                                  /* tp_descr_set */
+    0,                                  /* tp_dictoffset */
+    0,                                  /* tp_init */
+    0,                                  /* tp_alloc */
+    0,                                  /* tp_new */
+};
+
+/*-------------------------------------------------------------------------*/
+static bool
+ldmud_concrete_array_type_check (PyObject *ob)
+
+/* Returns true, when <ob> is a concrete LPC array type.
+ */
+
+{
+    return Py_TYPE(ob) == &ldmud_concrete_array_type_type;
+} /* ldmud_concrete_array_type_check() */
+
+/*-------------------------------------------------------------------------*/
+static PyMethodDef ldmud_concrete_array_type_new_method =
+{
+    "__new__",
+    (PyCFunction) ldmud_concrete_array_new,  METH_VARARGS | METH_KEYWORDS | METH_STATIC,
+    "__new__(values|size) -> ldmud.Array\n\n"
+    "Create an LPC array with the given values or of the given size."
+};
+
+static PyObject*
+ldmud_concrete_array_type_create (ldmud_lpctype_t* element)
+
+/* Create a type for Array[element type].
+ * This type class is never really used as a Python class type.
+ * It's __new__ function will create a type of ldmud.Array instead.
+ */
+
+{
+    ldmud_concrete_array_type_t *result;
+
+    result = (ldmud_concrete_array_type_t*) ldmud_concrete_array_type_type.tp_alloc(&ldmud_concrete_array_type_type, 0);
+    if (result == NULL)
+        return NULL;
+
+    result->ldmud_lpctype.type_base.tp_name = "ldmud.Array";
+    result->ldmud_lpctype.type_base.tp_doc = "LPC array";
+    result->ldmud_lpctype.type_base.tp_basicsize = sizeof(PyObject);
+    result->ldmud_lpctype.type_base.tp_base = &PyBaseObject_Type;
+    result->ldmud_lpctype.type_base.tp_flags = Py_TPFLAGS_DEFAULT|Py_TPFLAGS_TYPE_SUBCLASS|Py_TPFLAGS_HEAPTYPE;
+    result->ldmud_lpctype.type_base.tp_new = ldmud_concrete_array_new;
+    result->ldmud_lpctype.get_lpctype = (lpctype_factory)ldmud_concrete_array_get_lpctype;
+    result->element_type = element;
+    Py_INCREF(&PyBaseObject_Type);
+    Py_INCREF(element);
+
+    if (PyType_Ready(&result->ldmud_lpctype.type_base) < 0)
+    {
+        Py_DECREF(result);
+        return NULL;
+    }
+
+    if (result->ldmud_lpctype.type_base.tp_dict != NULL)
+    {
+        /* We set the __new__ function to a static method here.
+         * (Using .tp_new would result in circular dependencies as this
+         * method would be bound to the result object.)
+         */
+        PyObject *new_fun = PyCFunction_New(&ldmud_concrete_array_type_new_method, NULL);
+        if (new_fun == NULL
+         || PyDict_SetItemString(result->ldmud_lpctype.type_base.tp_dict, "__new__", new_fun) != 0)
+            PyErr_Clear();
+        Py_XDECREF(new_fun);
+    }
+
+    return (PyObject*)result;
+} /* ldmud_concrete_array_type_create() */
+
+/*-------------------------------------------------------------------------*/
+static PyObject*
+ldmud_any_array_type_subscript (PyTypeObject* array_type, PyObject *key)
+
+/* Create a type object that represents an array of a concrete type.
+ */
+
+{
+    PyObject *element = adapt_pythontype(key);
+    if (element && PyObject_TypeCheck(element, &ldmud_lpctype_type.type_base))
+    {
+        PyObject *result = ldmud_concrete_array_type_create((ldmud_lpctype_t*)element);
+        Py_DECREF(element);
+        return result;
+    }
+
+    Py_XDECREF(element);
+
+    PyErr_SetString(PyExc_TypeError, "key must be an ldmud.LPCType");
+    return NULL;
+} /* ldmud_any_array_type_subscript() */
+
+/*-------------------------------------------------------------------------*/
+static PyMappingMethods ldmud_any_array_type_as_mapping = {
+    0,                                          /*mp_length*/
+    (binaryfunc)ldmud_any_array_type_subscript, /*mp_subscript*/
+    0,                                          /*mp_ass_subscript*/
+};
+
+static PyTypeObject ldmud_any_array_type_type =
+{
+    PyVarObject_HEAD_INIT(NULL, 0)
+    "ldmud.ArrayType",                  /* tp_name */
+    sizeof(ldmud_lpctype_t),            /* tp_basicsize */
+    0,                                  /* tp_itemsize */
+    0,                                  /* tp_dealloc */
+    0,                                  /* tp_print */
+    0,                                  /* tp_getattr */
+    0,                                  /* tp_setattr */
+    0,                                  /* tp_reserved */
+    0,                                  /* tp_repr */
+    0,                                  /* tp_as_number */
+    0,                                  /* tp_as_sequence */
+    &ldmud_any_array_type_as_mapping,   /* tp_as_mapping */
+    0,                                  /* tp_hash  */
+    0,                                  /* tp_call */
+    0,                                  /* tp_str */
+    0,                                  /* tp_getattro */
+    0,                                  /* tp_setattro */
+    0,                                  /* tp_as_buffer */
+    Py_TPFLAGS_DEFAULT|Py_TPFLAGS_TYPE_SUBCLASS, /* tp_flags */
+    "LPC array type",                   /* tp_doc */
+    0,                                  /* tp_traverse */
+    0,                                  /* tp_clear */
+    0,                                  /* tp_richcompare */
+    0,                                  /* tp_weaklistoffset */
+    0,                                  /* tp_iter */
+    0,                                  /* tp_iternext */
+    0,                                  /* tp_methods */
+    0,                                  /* tp_members */
+    0,                                  /* tp_getset */
+    &ldmud_lpctype_type.type_base,      /* tp_base */
+    0,                                  /* tp_dict */
+    0,                                  /* tp_descr_get */
+    0,                                  /* tp_descr_set */
+    0,                                  /* tp_dictoffset */
+    0,                                  /* tp_init */
+    0,                                  /* tp_alloc */
+    0,                                  /* tp_new */
+};
+
+/*-------------------------------------------------------------------------*/
+/* LPC struct type. */
+
+static bool ldmud_concrete_struct_type_check(PyObject *ob);
+static PyObject* ldmud_concrete_struct_new(PyTypeObject *type, PyObject *args, PyObject *kwds);
+
+/*-------------------------------------------------------------------------*/
+static void
+ldmud_concrete_struct_type_dealloc (ldmud_concrete_struct_type_t* self)
+
+/* Destroy the ldmud_concrete_struct_type_t object
+ */
+
+{
+    free_struct_name(self->name);
+    REMOVE_GC_OBJECT(gc_struct_type_list, self);
+
+    Py_XDECREF(self->ldmud_lpctype.type_base.tp_base);
+    Py_XDECREF(self->ldmud_lpctype.type_base.tp_dict);
+    Py_XDECREF(self->ldmud_lpctype.type_base.tp_bases);
+    Py_XDECREF(self->ldmud_lpctype.type_base.tp_mro);
+    Py_XDECREF(self->ldmud_lpctype.type_base.tp_cache);
+    Py_XDECREF(self->ldmud_lpctype.type_base.tp_subclasses);
+
+    Py_TYPE(self)->tp_free((PyObject*)self);
+} /* ldmud_concrete_struct_type_dealloc() */
+
+/*-------------------------------------------------------------------------*/
+static PyObject*
+ldmud_concrete_struct_type_repr (ldmud_concrete_struct_type_t *type)
+
+/* Return a string representation for this struct type.
+ */
+
+{
+    return PyUnicode_FromFormat("ldmud.Struct[\"%s\",\"%s\"]", get_txt(type->name->prog_name), get_txt(type->name->name));
+} /* ldmud_concrete_struct_type_repr() */
+
+/*-------------------------------------------------------------------------*/
+static Py_hash_t
+ldmud_concrete_struct_type_hash (ldmud_concrete_struct_type_t *type)
+
+/* Return a hash of this concrete struct type.
+ */
+
+{
+    return (Py_hash_t)type->name->hash;
+} /* ldmud_concrete_struct_type_hash() */
+
+/*-------------------------------------------------------------------------*/
+static PyObject*
+ldmud_concrete_struct_type_richcompare (ldmud_concrete_struct_type_t *self, PyObject *other, int op)
+
+/* Compare <self> to <other> with the compare operation <op>.
+ */
+
+{
+    int cmp;
+
+    if (!ldmud_concrete_struct_type_check(other))
+        Py_RETURN_NOTIMPLEMENTED;
+
+    cmp = mstrcmp(self->name->prog_name, ((ldmud_concrete_struct_type_t*)other)->name->prog_name);
+    if (cmp == 0)
+        cmp = mstrcmp(self->name->name, ((ldmud_concrete_struct_type_t*)other)->name->name);
+
+    Py_RETURN_RICHCOMPARE(cmp, 0, op);
+} /* ldmud_concrete_struct_type_richcompare() */
+
+/*-------------------------------------------------------------------------*/
+static lpctype_t *
+ldmud_concrete_struct_get_lpctype(ldmud_concrete_struct_type_t *type)
+
+/* Create the LPC type object for the Python type.
+ */
+
+{
+    return get_struct_name_type(type->name);
+} /* ldmud_concrete_struct_get_lpctype() */
+
+/*-------------------------------------------------------------------------*/
+static PyMethodDef ldmud_concrete_struct_type_type_methods[] =
+{
+    {
+        "mro",
+        (PyCFunction) object_mro, METH_NOARGS,
+        "mro() -> tuple\n\n"
+        "Return the method resolution order."
+    },
+    {NULL}
+};
+
+static PyTypeObject ldmud_concrete_struct_type_type =
+{
+    PyVarObject_HEAD_INIT(NULL, 0)
+    "ldmud.StructType",                 /* tp_name */
+    sizeof(ldmud_concrete_struct_type_t),/* tp_basicsize */
+    0,                                  /* tp_itemsize */
+    (destructor)ldmud_concrete_struct_type_dealloc, /* tp_dealloc */
+    0,                                  /* tp_print */
+    0,                                  /* tp_getattr */
+    0,                                  /* tp_setattr */
+    0,                                  /* tp_reserved */
+    (reprfunc)ldmud_concrete_struct_type_repr, /* tp_repr */
+    0,                                  /* tp_as_number */
+    0,                                  /* tp_as_sequence */
+    0,                                  /* tp_as_mapping */
+    (hashfunc)ldmud_concrete_struct_type_hash, /* tp_hash  */
+    0,                                  /* tp_call */
+    0,                                  /* tp_str */
+    0,                                  /* tp_getattro */
+    0,                                  /* tp_setattro */
+    0,                                  /* tp_as_buffer */
+    Py_TPFLAGS_DEFAULT|Py_TPFLAGS_TYPE_SUBCLASS, /* tp_flags */
+    "LPC struct type",                   /* tp_doc */
+    0,                                  /* tp_traverse */
+    0,                                  /* tp_clear */
+    (richcmpfunc)ldmud_concrete_struct_type_richcompare, /* tp_richcompare */
+    0,                                  /* tp_weaklistoffset */
+    0,                                  /* tp_iter */
+    0,                                  /* tp_iternext */
+    ldmud_concrete_struct_type_type_methods, /* tp_methods */
+    0,                                  /* tp_members */
+    0,                                  /* tp_getset */
+    &ldmud_lpctype_type.type_base,      /* tp_base */
+    0,                                  /* tp_dict */
+    0,                                  /* tp_descr_get */
+    0,                                  /* tp_descr_set */
+    0,                                  /* tp_dictoffset */
+    0,                                  /* tp_init */
+    0,                                  /* tp_alloc */
+    0,                                  /* tp_new */
+};
+
+/*-------------------------------------------------------------------------*/
+static bool
+ldmud_concrete_struct_type_check (PyObject *ob)
+
+/* Returns true, when <ob> is a concrete LPC struct type.
+ */
+
+{
+    return Py_TYPE(ob) == &ldmud_concrete_struct_type_type;
+} /* ldmud_concrete_struct_type_check() */
+
+/*-------------------------------------------------------------------------*/
+static PyMethodDef ldmud_concrete_struct_type_new_method =
+{
+    "__new__",
+    (PyCFunction) ldmud_concrete_struct_new,  METH_VARARGS | METH_KEYWORDS | METH_STATIC,
+    "__new__(values) -> ldmud.Struct\n\n"
+    "Create an LPC struct with the given values."
+};
+
+static PyObject*
+ldmud_concrete_struct_type_create (struct_name_t* name)
+
+/* Create a type for Struct[<name->prog_name>, <name->name>].
+ * This type class is never really used as a Python class type.
+ * It's __new__ function will create a type of ldmud.Struct instead.
+ * The reference to <name> is adopted.
+ */
+
+{
+    ldmud_concrete_struct_type_t *result;
+
+    result = (ldmud_concrete_struct_type_t*) ldmud_concrete_struct_type_type.tp_alloc(&ldmud_concrete_struct_type_type, 0);
+    if (result == NULL)
+    {
+        free_struct_name(name);
+        return NULL;
+    }
+
+    result->ldmud_lpctype.type_base.tp_name = "ldmud.Struct";
+    result->ldmud_lpctype.type_base.tp_doc = "LPC struct";
+    result->ldmud_lpctype.type_base.tp_basicsize = sizeof(PyObject);
+    result->ldmud_lpctype.type_base.tp_base = &PyBaseObject_Type;
+    result->ldmud_lpctype.type_base.tp_flags = Py_TPFLAGS_DEFAULT|Py_TPFLAGS_TYPE_SUBCLASS|Py_TPFLAGS_HEAPTYPE;
+    result->ldmud_lpctype.type_base.tp_new = ldmud_concrete_struct_new;
+    result->ldmud_lpctype.get_lpctype = (lpctype_factory)ldmud_concrete_struct_get_lpctype;
+    result->name = name;
+    Py_INCREF(&PyBaseObject_Type);
+    ADD_GC_OBJECT(gc_struct_type_list, result);
+
+    if (PyType_Ready(&result->ldmud_lpctype.type_base) < 0)
+    {
+        Py_DECREF(result);
+        return NULL;
+    }
+
+    if (result->ldmud_lpctype.type_base.tp_dict != NULL)
+    {
+        /* We set the __new__ function to a static method here.
+         * (Using .tp_new would result in circular dependencies as this
+         * method would be bound to the result object.)
+         */
+        PyObject *new_fun = PyCFunction_New(&ldmud_concrete_struct_type_new_method, NULL);
+        if (new_fun == NULL
+         || PyDict_SetItemString(result->ldmud_lpctype.type_base.tp_dict, "__new__", new_fun) != 0)
+            PyErr_Clear();
+        Py_XDECREF(new_fun);
+    }
+
+    return (PyObject*)result;
+} /* ldmud_concrete_struct_type_create() */
+
+/*-------------------------------------------------------------------------*/
+static PyObject*
+ldmud_any_struct_type_subscript (PyTypeObject* struct_type, PyObject *key)
+
+/* Create a type object that represents an struct of a concrete type.
+ */
+
+{
+    PyObject *prog, *sname;
+    string_t *progstr, *snamestr;
+    struct_name_t *name;
+
+    if (!PyTuple_Check(key) || PyTuple_Size(key) != 2)
+    {
+        PyErr_SetString(PyExc_TypeError, "key must be (program name, struct name)");
+        return NULL;
+    }
+
+    prog = PyTuple_GetItem(key, 0);
+    sname = PyTuple_GetItem(key, 1);
+
+    if (ldmud_object_check(prog))
+    {
+        object_t *lpc_ob = ((ldmud_object_t*)prog)->lpc_object;
+        if(!lpc_ob)
+        {
+            PyErr_SetString(PyExc_TypeError, "uninitialized lpc object");
+            return NULL;
+        }
+
+        if (O_PROG_SWAPPED(lpc_ob) && load_ob_from_swap(lpc_ob) < 0)
+        {
+            PyErr_SetString(PyExc_MemoryError, "out of memory while unswapping");
+            return NULL;
+        }
+
+        progstr = ref_mstring(lpc_ob->prog->name);
+    }
+    else if (PyUnicode_Check(prog))
+    {
+        progstr = python_string_to_string(prog);
+        if (progstr == NULL)
+        {
+            PyErr_SetString(PyExc_ValueError, "could not decode program name");
+            return NULL;
+        }
+    }
+    else
+    {
+        PyErr_Format(PyExc_TypeError, "program name must be ldmud.Object or str, not %.200s", prog->ob_type->tp_name);
+        return NULL;
+    }
+
+    if (PyUnicode_Check(sname))
+    {
+        snamestr = python_string_to_string(sname);
+        if (snamestr == NULL)
+        {
+            free_mstring(progstr);
+            PyErr_SetString(PyExc_ValueError, "could not decode struct name");
+            return NULL;
+        }
+    }
+    else
+    {
+        free_mstring(progstr);
+        PyErr_Format(PyExc_TypeError, "struct name must be str, not %.200s", sname->ob_type->tp_name);
+        return NULL;
+    }
+
+    name = struct_new_name(snamestr, progstr);
+    if (name == NULL)
+    {
+        PyErr_SetString(PyExc_MemoryError, "out of memory");
+        return NULL;
+    }
+
+    return ldmud_concrete_struct_type_create(name);
+} /* ldmud_any_struct_type_subscript() */
+
+/*-------------------------------------------------------------------------*/
+static PyMappingMethods ldmud_any_struct_type_as_mapping = {
+    0,                                           /*mp_length*/
+    (binaryfunc)ldmud_any_struct_type_subscript, /*mp_subscript*/
+    0,                                           /*mp_ass_subscript*/
+};
+
+static PyTypeObject ldmud_any_struct_type_type =
+{
+    PyVarObject_HEAD_INIT(NULL, 0)
+    "ldmud.StructType",                 /* tp_name */
+    sizeof(ldmud_lpctype_t),            /* tp_basicsize */
+    0,                                  /* tp_itemsize */
+    0,                                  /* tp_dealloc */
+    0,                                  /* tp_print */
+    0,                                  /* tp_getattr */
+    0,                                  /* tp_setattr */
+    0,                                  /* tp_reserved */
+    0,                                  /* tp_repr */
+    0,                                  /* tp_as_number */
+    0,                                  /* tp_as_sequence */
+    &ldmud_any_struct_type_as_mapping,  /* tp_as_mapping */
+    0,                                  /* tp_hash  */
+    0,                                  /* tp_call */
+    0,                                  /* tp_str */
+    0,                                  /* tp_getattro */
+    0,                                  /* tp_setattro */
+    0,                                  /* tp_as_buffer */
+    Py_TPFLAGS_DEFAULT|Py_TPFLAGS_TYPE_SUBCLASS, /* tp_flags */
+    "LPC struct type",                  /* tp_doc */
+    0,                                  /* tp_traverse */
+    0,                                  /* tp_clear */
+    0,                                  /* tp_richcompare */
+    0,                                  /* tp_weaklistoffset */
+    0,                                  /* tp_iter */
+    0,                                  /* tp_iternext */
+    0,                                  /* tp_methods */
+    0,                                  /* tp_members */
+    0,                                  /* tp_getset */
+    &ldmud_lpctype_type.type_base,      /* tp_base */
+    0,                                  /* tp_dict */
+    0,                                  /* tp_descr_get */
+    0,                                  /* tp_descr_set */
+    0,                                  /* tp_dictoffset */
+    0,                                  /* tp_init */
+    0,                                  /* tp_alloc */
+    0,                                  /* tp_new */
+};
+
+/*-------------------------------------------------------------------------*/
+/* LPC object type. */
+
+static bool ldmud_concrete_object_type_check(PyObject *ob);
+static PyObject* ldmud_concrete_object_new(PyTypeObject *type, PyObject *args, PyObject *kwds);
+
+/*-------------------------------------------------------------------------*/
+static PyObject*
+ldmud_concrete_object_type_repr (ldmud_gc_lpctype_type_t *type)
+
+/* Return a string representation for this object type.
+ */
+
+{
+    assert(type->type->t_class == TCLASS_OBJECT);
+    return PyUnicode_FromFormat("ldmud.Object[%s]", get_txt(type->type->t_object.program_name));
+} /* ldmud_concrete_object_type_repr() */
+
+/*-------------------------------------------------------------------------*/
+static PyObject*
+ldmud_concrete_object_type_richcompare (ldmud_gc_lpctype_type_t *self, PyObject *other, int op)
+
+/* Compare <self> to <other> with the compare operation <op>.
+ */
+
+{
+    if (!ldmud_concrete_object_type_check(other))
+        Py_RETURN_NOTIMPLEMENTED;
+
+    return pointer_richcompare(self->type, ((ldmud_gc_lpctype_type_t*)other)->type, op);
+} /* ldmud_concrete_object_type_richcompare() */
+
+/*-------------------------------------------------------------------------*/
+static PyMethodDef ldmud_concrete_object_type_type_methods[] =
+{
+    {
+        "mro",
+        (PyCFunction) object_mro, METH_NOARGS,
+        "mro() -> tuple\n\n"
+        "Return the method resolution order."
+    },
+    {NULL}
+};
+
+static PyTypeObject ldmud_concrete_object_type_type =
+{
+    PyVarObject_HEAD_INIT(NULL, 0)
+    "ldmud.ObjectType",                 /* tp_name */
+    sizeof(ldmud_gc_lpctype_type_t),    /* tp_basicsize */
+    0,                                  /* tp_itemsize */
+    (destructor)ldmud_lpctype_type_dealloc, /* tp_dealloc */
+    0,                                  /* tp_print */
+    0,                                  /* tp_getattr */
+    0,                                  /* tp_setattr */
+    0,                                  /* tp_reserved */
+    (reprfunc)ldmud_concrete_object_type_repr, /* tp_repr */
+    0,                                  /* tp_as_number */
+    0,                                  /* tp_as_sequence */
+    0,                                  /* tp_as_mapping */
+    (hashfunc)ldmud_lpctype_type_hash,  /* tp_hash  */
+    0,                                  /* tp_call */
+    0,                                  /* tp_str */
+    0,                                  /* tp_getattro */
+    0,                                  /* tp_setattro */
+    0,                                  /* tp_as_buffer */
+    Py_TPFLAGS_DEFAULT|Py_TPFLAGS_TYPE_SUBCLASS, /* tp_flags */
+    "LPC object type",                  /* tp_doc */
+    0,                                  /* tp_traverse */
+    0,                                  /* tp_clear */
+    (richcmpfunc)ldmud_concrete_object_type_richcompare, /* tp_richcompare */
+    0,                                  /* tp_weaklistoffset */
+    0,                                  /* tp_iter */
+    0,                                  /* tp_iternext */
+    ldmud_concrete_object_type_type_methods, /* tp_methods */
+    0,                                  /* tp_members */
+    0,                                  /* tp_getset */
+    &ldmud_lpctype_type.type_base,      /* tp_base */
+    0,                                  /* tp_dict */
+    0,                                  /* tp_descr_get */
+    0,                                  /* tp_descr_set */
+    0,                                  /* tp_dictoffset */
+    0,                                  /* tp_init */
+    0,                                  /* tp_alloc */
+    0,                                  /* tp_new */
+};
+
+/*-------------------------------------------------------------------------*/
+static bool
+ldmud_concrete_object_type_check (PyObject *ob)
+
+/* Returns true, when <ob> is a concrete LPC object type.
+ */
+
+{
+    return Py_TYPE(ob) == &ldmud_concrete_object_type_type;
+} /* ldmud_concrete_object_type_check() */
+
+/*-------------------------------------------------------------------------*/
+static PyMethodDef ldmud_concrete_object_type_new_method =
+{
+    "__new__",
+    (PyCFunction) ldmud_concrete_object_new,  METH_VARARGS | METH_KEYWORDS | METH_STATIC,
+    "__new__(filename) -> ldmud.Object\n\n"
+    "Create an LPC object from the filename."
+};
+
+static PyObject*
+ldmud_concrete_object_type_create (lpctype_t* object_type)
+
+/* Create a type for <object_type>, which is assumed to be a named object type.
+ * The reference for <object_type> will be adopted.
+ * This type class is never really used as a Python class type.
+ * It's __new__ function will create a type of ldmud.Object instead.
+ */
+
+{
+    ldmud_gc_lpctype_type_t *result;
+
+    result = (ldmud_gc_lpctype_type_t*) ldmud_concrete_object_type_type.tp_alloc(&ldmud_concrete_object_type_type, 0);
+    if (result == NULL)
+        return NULL;
+
+    result->ldmud_lpctype.type_base.tp_name = "ldmud.Object";
+    result->ldmud_lpctype.type_base.tp_doc = "LPC object";
+    result->ldmud_lpctype.type_base.tp_basicsize = sizeof(PyObject);
+    result->ldmud_lpctype.type_base.tp_base = &PyBaseObject_Type;
+    result->ldmud_lpctype.type_base.tp_flags = Py_TPFLAGS_DEFAULT|Py_TPFLAGS_TYPE_SUBCLASS|Py_TPFLAGS_HEAPTYPE;
+    result->ldmud_lpctype.type_base.tp_new = ldmud_concrete_object_new;
+    result->ldmud_lpctype.get_lpctype = (lpctype_factory)ldmud_lpctype_type_get_lpctype;
+    result->type = object_type;
+    Py_INCREF(&PyBaseObject_Type);
+
+    add_gc_lpctype_object(result);
+
+    if (PyType_Ready(&result->ldmud_lpctype.type_base) < 0)
+    {
+        Py_DECREF(result);
+        return NULL;
+    }
+
+    if (result->ldmud_lpctype.type_base.tp_dict != NULL)
+    {
+        /* We set the __new__ function to a static method here.
+         * (Using .tp_new would result in circular dependencies as this
+         * method would be bound to the result object.)
+         */
+        PyObject *new_fun = PyCFunction_New(&ldmud_concrete_object_type_new_method, NULL);
+        if (new_fun == NULL
+         || PyDict_SetItemString(result->ldmud_lpctype.type_base.tp_dict, "__new__", new_fun) != 0)
+            PyErr_Clear();
+        Py_XDECREF(new_fun);
+    }
+
+    return (PyObject*)result;
+} /* ldmud_concrete_object_type_create() */
+
+/*-------------------------------------------------------------------------*/
+static PyObject*
+ldmud_any_object_type_subscript (PyTypeObject* object_type, PyObject *key)
+
+/* Create a type object that represents a named object type.
+ */
+
+{
+    string_t *name = python_string_to_string(key);
+    if (name != NULL)
+    {
+        lpctype_t *obtype = get_object_type(name);
+
+        free_mstring(name);
+        if (!obtype)
+        {
+            PyErr_SetString(PyExc_MemoryError, "out of memory");
+            return NULL;
+        }
+
+        return ldmud_concrete_object_type_create(obtype);
+    }
+
+    PyErr_SetString(PyExc_TypeError, "key must be a string");
+    return NULL;
+} /* ldmud_any_object_type_subscript() */
+
+/*-------------------------------------------------------------------------*/
+static PyMappingMethods ldmud_any_object_type_as_mapping = {
+    0,                                           /*mp_length*/
+    (binaryfunc)ldmud_any_object_type_subscript, /*mp_subscript*/
+    0,                                           /*mp_ass_subscript*/
+};
+
+static PyTypeObject ldmud_any_object_type_type =
+{
+    PyVarObject_HEAD_INIT(NULL, 0)
+    "ldmud.ObjectType",                 /* tp_name */
+    sizeof(ldmud_lpctype_t),            /* tp_basicsize */
+    0,                                  /* tp_itemsize */
+    0,                                  /* tp_dealloc */
+    0,                                  /* tp_print */
+    0,                                  /* tp_getattr */
+    0,                                  /* tp_setattr */
+    0,                                  /* tp_reserved */
+    0,                                  /* tp_repr */
+    0,                                  /* tp_as_number */
+    0,                                  /* tp_as_sequence */
+    &ldmud_any_object_type_as_mapping,  /* tp_as_mapping */
+    0,                                  /* tp_hash  */
+    0,                                  /* tp_call */
+    0,                                  /* tp_str */
+    0,                                  /* tp_getattro */
+    0,                                  /* tp_setattro */
+    0,                                  /* tp_as_buffer */
+    Py_TPFLAGS_DEFAULT|Py_TPFLAGS_TYPE_SUBCLASS, /* tp_flags */
+    "LPC object type",                  /* tp_doc */
+    0,                                  /* tp_traverse */
+    0,                                  /* tp_clear */
+    0,                                  /* tp_richcompare */
+    0,                                  /* tp_weaklistoffset */
+    0,                                  /* tp_iter */
+    0,                                  /* tp_iternext */
+    0,                                  /* tp_methods */
+    0,                                  /* tp_members */
+    0,                                  /* tp_getset */
+    &ldmud_lpctype_type.type_base,      /* tp_base */
+    0,                                  /* tp_dict */
+    0,                                  /* tp_descr_get */
+    0,                                  /* tp_descr_set */
+    0,                                  /* tp_dictoffset */
+    0,                                  /* tp_init */
+    0,                                  /* tp_alloc */
+    0,                                  /* tp_new */
+};
+
+/*-------------------------------------------------------------------------*/
+/* LPC lightweight object type. */
+
+static bool ldmud_concrete_lwobject_type_check(PyObject *ob);
+static PyObject* ldmud_concrete_lwobject_new(PyTypeObject *type, PyObject *args, PyObject *kwds);
+
+/*-------------------------------------------------------------------------*/
+static PyObject*
+ldmud_concrete_lwobject_type_repr (ldmud_gc_lpctype_type_t *type)
+
+/* Return a string representation for this object type.
+ */
+
+{
+    assert(type->type->t_class == TCLASS_OBJECT);
+    return PyUnicode_FromFormat("ldmud.LWObject[%s]", get_txt(type->type->t_object.program_name));
+} /* ldmud_concrete_lwobject_type_repr() */
+
+/*-------------------------------------------------------------------------*/
+static PyObject*
+ldmud_concrete_lwobject_type_richcompare (ldmud_gc_lpctype_type_t *self, PyObject *other, int op)
+
+/* Compare <self> to <other> with the compare operation <op>.
+ */
+
+{
+    if (!ldmud_concrete_lwobject_type_check(other))
+        Py_RETURN_NOTIMPLEMENTED;
+
+    return pointer_richcompare(self->type, ((ldmud_gc_lpctype_type_t*)other)->type, op);
+} /* ldmud_concrete_lwobject_type_richcompare() */
+
+/*-------------------------------------------------------------------------*/
+static PyMethodDef ldmud_concrete_lwobject_type_type_methods[] =
+{
+    {
+        "mro",
+        (PyCFunction) object_mro, METH_NOARGS,
+        "mro() -> tuple\n\n"
+        "Return the method resolution order."
+    },
+    {NULL}
+};
+
+static PyTypeObject ldmud_concrete_lwobject_type_type =
+{
+    PyVarObject_HEAD_INIT(NULL, 0)
+    "ldmud.LWObjectType",               /* tp_name */
+    sizeof(ldmud_gc_lpctype_type_t),    /* tp_basicsize */
+    0,                                  /* tp_itemsize */
+    (destructor)ldmud_lpctype_type_dealloc, /* tp_dealloc */
+    0,                                  /* tp_print */
+    0,                                  /* tp_getattr */
+    0,                                  /* tp_setattr */
+    0,                                  /* tp_reserved */
+    (reprfunc)ldmud_concrete_lwobject_type_repr, /* tp_repr */
+    0,                                  /* tp_as_number */
+    0,                                  /* tp_as_sequence */
+    0,                                  /* tp_as_mapping */
+    (hashfunc)ldmud_lpctype_type_hash,  /* tp_hash  */
+    0,                                  /* tp_call */
+    0,                                  /* tp_str */
+    0,                                  /* tp_getattro */
+    0,                                  /* tp_setattro */
+    0,                                  /* tp_as_buffer */
+    Py_TPFLAGS_DEFAULT|Py_TPFLAGS_TYPE_SUBCLASS, /* tp_flags */
+    "LPC object type",                  /* tp_doc */
+    0,                                  /* tp_traverse */
+    0,                                  /* tp_clear */
+    (richcmpfunc)ldmud_concrete_lwobject_type_richcompare, /* tp_richcompare */
+    0,                                  /* tp_weaklistoffset */
+    0,                                  /* tp_iter */
+    0,                                  /* tp_iternext */
+    ldmud_concrete_lwobject_type_type_methods, /* tp_methods */
+    0,                                  /* tp_members */
+    0,                                  /* tp_getset */
+    &ldmud_lpctype_type.type_base,      /* tp_base */
+    0,                                  /* tp_dict */
+    0,                                  /* tp_descr_get */
+    0,                                  /* tp_descr_set */
+    0,                                  /* tp_dictoffset */
+    0,                                  /* tp_init */
+    0,                                  /* tp_alloc */
+    0,                                  /* tp_new */
+};
+
+/*-------------------------------------------------------------------------*/
+static bool
+ldmud_concrete_lwobject_type_check (PyObject *ob)
+
+/* Returns true, when <ob> is a concrete LPC object type.
+ */
+
+{
+    return Py_TYPE(ob) == &ldmud_concrete_lwobject_type_type;
+} /* ldmud_concrete_lwobject_type_check() */
+
+/*-------------------------------------------------------------------------*/
+static PyMethodDef ldmud_concrete_lwobject_type_new_method =
+{
+    "__new__",
+    (PyCFunction) ldmud_concrete_lwobject_new,  METH_VARARGS | METH_KEYWORDS | METH_STATIC,
+    "__new__(filename) -> ldmud.LWObject\n\n"
+    "Create an LPC lightweight object from the filename."
+};
+
+static PyObject*
+ldmud_concrete_lwobject_type_create (lpctype_t* lwobject_type)
+
+/* Create a type for <lwobject_type>, which is assumed to be a named
+ * lwobject type. The reference for <lwobject_type> will be adopted.
+ * This type class is never really used as a Python class type.
+ * It's __new__ function will create a type of ldmud.Object instead.
+ */
+
+{
+    ldmud_gc_lpctype_type_t *result;
+
+    result = (ldmud_gc_lpctype_type_t*) ldmud_concrete_lwobject_type_type.tp_alloc(&ldmud_concrete_lwobject_type_type, 0);
+    if (result == NULL)
+        return NULL;
+
+    result->ldmud_lpctype.type_base.tp_name = "ldmud.LWObject";
+    result->ldmud_lpctype.type_base.tp_doc = "LPC lightweight object";
+    result->ldmud_lpctype.type_base.tp_basicsize = sizeof(PyObject);
+    result->ldmud_lpctype.type_base.tp_base = &PyBaseObject_Type;
+    result->ldmud_lpctype.type_base.tp_flags = Py_TPFLAGS_DEFAULT|Py_TPFLAGS_TYPE_SUBCLASS|Py_TPFLAGS_HEAPTYPE;
+    result->ldmud_lpctype.type_base.tp_new = ldmud_concrete_lwobject_new;
+    result->ldmud_lpctype.get_lpctype = (lpctype_factory)ldmud_lpctype_type_get_lpctype;
+    result->type = lwobject_type;
+    Py_INCREF(&PyBaseObject_Type);
+
+    add_gc_lpctype_object(result);
+
+    if (PyType_Ready(&result->ldmud_lpctype.type_base) < 0)
+    {
+        Py_DECREF(result);
+        return NULL;
+    }
+
+    if (result->ldmud_lpctype.type_base.tp_dict != NULL)
+    {
+        /* We set the __new__ function to a static method here.
+         * (Using .tp_new would result in circular dependencies as this
+         * method would be bound to the result object.)
+         */
+        PyObject *new_fun = PyCFunction_New(&ldmud_concrete_lwobject_type_new_method, NULL);
+        if (new_fun == NULL
+         || PyDict_SetItemString(result->ldmud_lpctype.type_base.tp_dict, "__new__", new_fun) != 0)
+            PyErr_Clear();
+        Py_XDECREF(new_fun);
+    }
+
+    return (PyObject*)result;
+} /* ldmud_concrete_lwobject_type_create() */
+
+/*-------------------------------------------------------------------------*/
+static PyObject*
+ldmud_any_lwobject_type_subscript (PyTypeObject* lwobject_type, PyObject *key)
+
+/* Create a type object that represents a named lightweight object type.
+ */
+
+{
+    string_t *name = python_string_to_string(key);
+    if (name != NULL)
+    {
+        lpctype_t *obtype = get_lwobject_type(name);
+
+        free_mstring(name);
+        if (!obtype)
+        {
+            PyErr_SetString(PyExc_MemoryError, "out of memory");
+            return NULL;
+        }
+
+        return ldmud_concrete_lwobject_type_create(obtype);
+    }
+
+    PyErr_SetString(PyExc_TypeError, "key must be a string");
+    return NULL;
+} /* ldmud_any_lwobject_type_subscript() */
+
+/*-------------------------------------------------------------------------*/
+static PyMappingMethods ldmud_any_lwobject_type_as_mapping = {
+    0,                                             /*mp_length*/
+    (binaryfunc)ldmud_any_lwobject_type_subscript, /*mp_subscript*/
+    0,                                             /*mp_ass_subscript*/
+};
+
+static PyTypeObject ldmud_any_lwobject_type_type =
+{
+    PyVarObject_HEAD_INIT(NULL, 0)
+    "ldmud.LWObjectType",               /* tp_name */
+    sizeof(ldmud_lpctype_t),            /* tp_basicsize */
+    0,                                  /* tp_itemsize */
+    0,                                  /* tp_dealloc */
+    0,                                  /* tp_print */
+    0,                                  /* tp_getattr */
+    0,                                  /* tp_setattr */
+    0,                                  /* tp_reserved */
+    0,                                  /* tp_repr */
+    0,                                  /* tp_as_number */
+    0,                                  /* tp_as_sequence */
+    &ldmud_any_lwobject_type_as_mapping,/* tp_as_mapping */
+    0,                                  /* tp_hash  */
+    0,                                  /* tp_call */
+    0,                                  /* tp_str */
+    0,                                  /* tp_getattro */
+    0,                                  /* tp_setattro */
+    0,                                  /* tp_as_buffer */
+    Py_TPFLAGS_DEFAULT|Py_TPFLAGS_TYPE_SUBCLASS, /* tp_flags */
+    "LPC object type",                  /* tp_doc */
+    0,                                  /* tp_traverse */
+    0,                                  /* tp_clear */
+    0,                                  /* tp_richcompare */
+    0,                                  /* tp_weaklistoffset */
+    0,                                  /* tp_iter */
+    0,                                  /* tp_iternext */
+    0,                                  /* tp_methods */
+    0,                                  /* tp_members */
+    0,                                  /* tp_getset */
+    &ldmud_lpctype_type.type_base,      /* tp_base */
+    0,                                  /* tp_dict */
+    0,                                  /* tp_descr_get */
+    0,                                  /* tp_descr_set */
+    0,                                  /* tp_dictoffset */
+    0,                                  /* tp_init */
+    0,                                  /* tp_alloc */
+    0,                                  /* tp_new */
+};
+
+/*-------------------------------------------------------------------------*/
+/* Integer */
+
+/*-------------------------------------------------------------------------*/
+static lpctype_t*
+ldmud_integer_get_lpctype (ldmud_lpctype_t* type)
+
+/* Return the lpctype for ldmud.Integer.
+ */
+
+{
+    return lpctype_int;
+} /* ldmud_integer_get_lpctype() */
+
+/*-------------------------------------------------------------------------*/
+
+static ldmud_lpctype_t ldmud_integer_type =
+{{
+    PyVarObject_HEAD_INIT(&ldmud_lpctype_type.type_base, 0)
+    "ldmud.Integer",                    /* tp_name */
+    0,                                  /* tp_basicsize */
+    0,                                  /* tp_itemsize */
+    0,                                  /* tp_dealloc */
+    0,                                  /* tp_print */
+    0,                                  /* tp_getattr */
+    0,                                  /* tp_setattr */
+    0,                                  /* tp_reserved */
+    0,                                  /* tp_repr */
+    0,                                  /* tp_as_number */
+    0,                                  /* tp_as_sequence */
+    0,                                  /* tp_as_mapping */
+    0,                                  /* tp_hash  */
+    0,                                  /* tp_call */
+    0,                                  /* tp_str */
+    0,                                  /* tp_getattro */
+    0,                                  /* tp_setattro */
+    0,                                  /* tp_as_buffer */
+    Py_TPFLAGS_DEFAULT|Py_TPFLAGS_TYPE_SUBCLASS, /* tp_flags */
+    "LPC integer",                      /* tp_doc */
+    0,                                  /* tp_traverse */
+    0,                                  /* tp_clear */
+    0,                                  /* tp_richcompare */
+    0,                                  /* tp_weaklistoffset */
+    0,                                  /* tp_iter */
+    0,                                  /* tp_iternext */
+    0,                                  /* tp_methods */
+    0,                                  /* tp_members */
+    0,                                  /* tp_getset */
+    &PyLong_Type,                       /* tp_base */
+    0,                                  /* tp_dict */
+    0,                                  /* tp_descr_get */
+    0,                                  /* tp_descr_set */
+    0,                                  /* tp_dictoffset */
+    0,                                  /* tp_init */
+    0,                                  /* tp_alloc */
+    0,                                  /* tp_new */
+},  ldmud_integer_get_lpctype           /* get_lpctype */
+};
+
+/*-------------------------------------------------------------------------*/
+/* Float */
+
+/*-------------------------------------------------------------------------*/
+static lpctype_t*
+ldmud_float_get_lpctype (ldmud_lpctype_t* type)
+
+/* Return the lpctype for ldmud.Float.
+ */
+
+{
+    return lpctype_float;
+} /* ldmud_float_get_lpctype() */
+
+/*-------------------------------------------------------------------------*/
+
+static ldmud_lpctype_t ldmud_float_type =
+{{
+    PyVarObject_HEAD_INIT(&ldmud_lpctype_type.type_base, 0)
+    "ldmud.Float",                      /* tp_name */
+    0,                                  /* tp_basicsize */
+    0,                                  /* tp_itemsize */
+    0,                                  /* tp_dealloc */
+    0,                                  /* tp_print */
+    0,                                  /* tp_getattr */
+    0,                                  /* tp_setattr */
+    0,                                  /* tp_reserved */
+    0,                                  /* tp_repr */
+    0,                                  /* tp_as_number */
+    0,                                  /* tp_as_sequence */
+    0,                                  /* tp_as_mapping */
+    0,                                  /* tp_hash  */
+    0,                                  /* tp_call */
+    0,                                  /* tp_str */
+    0,                                  /* tp_getattro */
+    0,                                  /* tp_setattro */
+    0,                                  /* tp_as_buffer */
+    Py_TPFLAGS_DEFAULT|Py_TPFLAGS_TYPE_SUBCLASS, /* tp_flags */
+    "LPC float",                        /* tp_doc */
+    0,                                  /* tp_traverse */
+    0,                                  /* tp_clear */
+    0,                                  /* tp_richcompare */
+    0,                                  /* tp_weaklistoffset */
+    0,                                  /* tp_iter */
+    0,                                  /* tp_iternext */
+    0,                                  /* tp_methods */
+    0,                                  /* tp_members */
+    0,                                  /* tp_getset */
+    &PyFloat_Type,                      /* tp_base */
+    0,                                  /* tp_dict */
+    0,                                  /* tp_descr_get */
+    0,                                  /* tp_descr_set */
+    0,                                  /* tp_dictoffset */
+    0,                                  /* tp_init */
+    0,                                  /* tp_alloc */
+    0,                                  /* tp_new */
+},  ldmud_float_get_lpctype             /* get_lpctype */
+};
+
+/*-------------------------------------------------------------------------*/
+/* String */
+
+/*-------------------------------------------------------------------------*/
+static lpctype_t*
+ldmud_string_get_lpctype (ldmud_lpctype_t* type)
+
+/* Return the lpctype for ldmud.String.
+ */
+
+{
+    return lpctype_string;
+} /* ldmud_string_get_lpctype() */
+
+/*-------------------------------------------------------------------------*/
+
+static ldmud_lpctype_t ldmud_string_type =
+{{
+    PyVarObject_HEAD_INIT(&ldmud_lpctype_type.type_base, 0)
+    "ldmud.String",                     /* tp_name */
+    0,                                  /* tp_basicsize */
+    0,                                  /* tp_itemsize */
+    0,                                  /* tp_dealloc */
+    0,                                  /* tp_print */
+    0,                                  /* tp_getattr */
+    0,                                  /* tp_setattr */
+    0,                                  /* tp_reserved */
+    0,                                  /* tp_repr */
+    0,                                  /* tp_as_number */
+    0,                                  /* tp_as_sequence */
+    0,                                  /* tp_as_mapping */
+    0,                                  /* tp_hash  */
+    0,                                  /* tp_call */
+    0,                                  /* tp_str */
+    0,                                  /* tp_getattro */
+    0,                                  /* tp_setattro */
+    0,                                  /* tp_as_buffer */
+    Py_TPFLAGS_DEFAULT|Py_TPFLAGS_TYPE_SUBCLASS, /* tp_flags */
+    "LPC string",                       /* tp_doc */
+    0,                                  /* tp_traverse */
+    0,                                  /* tp_clear */
+    0,                                  /* tp_richcompare */
+    0,                                  /* tp_weaklistoffset */
+    0,                                  /* tp_iter */
+    0,                                  /* tp_iternext */
+    0,                                  /* tp_methods */
+    0,                                  /* tp_members */
+    0,                                  /* tp_getset */
+    &PyUnicode_Type,                    /* tp_base */
+    0,                                  /* tp_dict */
+    0,                                  /* tp_descr_get */
+    0,                                  /* tp_descr_set */
+    0,                                  /* tp_dictoffset */
+    0,                                  /* tp_init */
+    0,                                  /* tp_alloc */
+    0,                                  /* tp_new */
+},  ldmud_string_get_lpctype            /* get_lpctype */
+};
+
+/*-------------------------------------------------------------------------*/
+/* Bytes */
+
+/*-------------------------------------------------------------------------*/
+static lpctype_t*
+ldmud_bytes_get_lpctype (ldmud_lpctype_t* type)
+
+/* Return the lpctype for ldmud.Bytes.
+ */
+
+{
+    return lpctype_bytes;
+} /* ldmud_bytes_get_lpctype() */
+
+/*-------------------------------------------------------------------------*/
+
+static ldmud_lpctype_t ldmud_bytes_type =
+{{
+    PyVarObject_HEAD_INIT(&ldmud_lpctype_type.type_base, 0)
+    "ldmud.Bytes",                     /* tp_name */
+    0,                                  /* tp_basicsize */
+    0,                                  /* tp_itemsize */
+    0,                                  /* tp_dealloc */
+    0,                                  /* tp_print */
+    0,                                  /* tp_getattr */
+    0,                                  /* tp_setattr */
+    0,                                  /* tp_reserved */
+    0,                                  /* tp_repr */
+    0,                                  /* tp_as_number */
+    0,                                  /* tp_as_sequence */
+    0,                                  /* tp_as_mapping */
+    0,                                  /* tp_hash  */
+    0,                                  /* tp_call */
+    0,                                  /* tp_str */
+    0,                                  /* tp_getattro */
+    0,                                  /* tp_setattro */
+    0,                                  /* tp_as_buffer */
+    Py_TPFLAGS_DEFAULT|Py_TPFLAGS_TYPE_SUBCLASS, /* tp_flags */
+    "LPC bytes",                       /* tp_doc */
+    0,                                  /* tp_traverse */
+    0,                                  /* tp_clear */
+    0,                                  /* tp_richcompare */
+    0,                                  /* tp_weaklistoffset */
+    0,                                  /* tp_iter */
+    0,                                  /* tp_iternext */
+    0,                                  /* tp_methods */
+    0,                                  /* tp_members */
+    0,                                  /* tp_getset */
+    &PyBytes_Type,                      /* tp_base */
+    0,                                  /* tp_dict */
+    0,                                  /* tp_descr_get */
+    0,                                  /* tp_descr_set */
+    0,                                  /* tp_dictoffset */
+    0,                                  /* tp_init */
+    0,                                  /* tp_alloc */
+    0,                                  /* tp_new */
+},  ldmud_bytes_get_lpctype            /* get_lpctype */
+};
+
+/*-------------------------------------------------------------------------*/
 /* Programs (Regular and Lightweight Objects) */
 
 /*-------------------------------------------------------------------------*/
@@ -1076,7 +3480,7 @@ ldmud_program_bool(ldmud_program_t *self)
         default:
             return false;
     }
-} /* ldmud_object_bool() */
+} /* ldmud_program_bool() */
 
 /*-------------------------------------------------------------------------*/
 static void
@@ -1626,7 +4030,7 @@ ldmud_program_lfun_get_arguments (ldmud_program_and_index_t *lfun, void *closure
         arg->type = NULL;
 
         if (progp->argument_types && progp->type_start && progp->type_start[fx] != INDEX_START_NONE)
-            arg->type = lpctype_to_pythontype(progp->argument_types[progp->type_start[fx] + i]);
+            arg->type = lpctype_to_pythontype(progp->types[progp->argument_types[progp->type_start[fx] + i]]);
 
         PyList_SET_ITEM(result, i, (PyObject*)arg);
     }
@@ -2570,7 +4974,7 @@ ldmud_object_dealloc (ldmud_object_t* self)
 static PyObject*
 ldmud_object_new (PyTypeObject *type, PyObject *args, PyObject *kwds)
 
-/* Implmenent __new__ for ldmud_object_t, i.e. allocate and initialize
+/* Implement __new__ for ldmud_object_t, i.e. allocate and initialize
  * the object with null values.
  */
 
@@ -2741,8 +5145,6 @@ ldmud_object_setattro (ldmud_object_t *val, PyObject *name, PyObject *value)
 } /* ldmud_object_setattro() */
 
 /*-------------------------------------------------------------------------*/
-static bool ldmud_object_check(PyObject *ob);
-
 static PyObject*
 ldmud_object_richcompare (ldmud_object_t *self, PyObject *other, int op)
 
@@ -2750,46 +5152,13 @@ ldmud_object_richcompare (ldmud_object_t *self, PyObject *other, int op)
  */
 
 {
-    object_t *self_ob, *other_ob;
-    bool result;
-    PyObject* resultval;
-
     if (!ldmud_object_check(other))
     {
         Py_INCREF(Py_NotImplemented);
         return Py_NotImplemented;
     }
 
-    self_ob = self->lpc_object;
-    other_ob = ((ldmud_object_t*)other)->lpc_object;
-
-    if(self_ob == NULL && other_ob == NULL)
-        result = op == Py_LE || op == Py_EQ || op == Py_GE;
-    else if(self_ob == NULL)
-        result = op == Py_LT || op == Py_LE || op == Py_NE;
-    else if(other_ob == NULL)
-        result = op == Py_GT || op == Py_GE || op == Py_NE;
-    else
-    {
-        switch (op)
-        {
-            case Py_LT: result = mstring_compare(self_ob->name, other_ob->name) < 0; break;
-            case Py_LE: result = mstring_compare(self_ob->name, other_ob->name) <= 0; break;
-            case Py_EQ: result = self_ob == other_ob; break;
-            case Py_NE: result = self_ob != other_ob; break;
-            case Py_GT: result = mstring_compare(self_ob->name, other_ob->name) > 0; break;
-            case Py_GE: result = mstring_compare(self_ob->name, other_ob->name) >= 0; break;
-            default:
-            {
-                Py_INCREF(Py_NotImplemented);
-                return Py_NotImplemented;
-            }
-        }
-    }
-
-    resultval = result ? Py_True : Py_False;
-    Py_INCREF(resultval);
-    return resultval;
+    return pointer_richcompare(self->lpc_object, ((ldmud_object_t*)other)->lpc_object, op);
 } /* ldmud_object_richcompare() */
 
 /*-------------------------------------------------------------------------*/
@@ -2848,6 +5217,17 @@ ldmud_object_get_list (ldmud_object_t *val, PyTypeObject *type)
 } /* ldmud_object_get_list() */
 
 /*-------------------------------------------------------------------------*/
+static lpctype_t*
+ldmud_object_get_lpctype (ldmud_lpctype_t* type)
+
+/* Return the lpctype for ldmud.Object.
+ */
+
+{
+    return lpctype_any_object;
+} /* ldmud_object_get_lpctype() */
+
+/*-------------------------------------------------------------------------*/
 static PyNumberMethods ldmud_object_as_number =
 {
     0,                                  /* nb_add */
@@ -2875,9 +5255,9 @@ static PyGetSetDef ldmud_object_getset[] =
     {NULL}
 };
 
-static PyTypeObject ldmud_object_type =
-{
-    PyVarObject_HEAD_INIT(NULL, 0)
+static ldmud_lpctype_t ldmud_object_type =
+{{
+    PyVarObject_HEAD_INIT(&ldmud_any_object_type_type, 0)
     "ldmud.Object",                     /* tp_name */
     sizeof(ldmud_object_t),             /* tp_basicsize */
     0,                                  /* tp_itemsize */
@@ -2915,6 +5295,7 @@ static PyTypeObject ldmud_object_type =
     (initproc)ldmud_object_init,        /* tp_init */
     0,                                  /* tp_alloc */
     ldmud_object_new,                   /* tp_new */
+},  ldmud_object_get_lpctype            /* get_lpctype */
 };
 
 
@@ -2926,7 +5307,7 @@ ldmud_object_check (PyObject *ob)
  */
 
 {
-    return Py_TYPE(ob) == &ldmud_object_type;
+    return Py_TYPE(ob) == &ldmud_object_type.type_base;
 } /* ldmud_object_check() */
 
 /*-------------------------------------------------------------------------*/
@@ -2939,7 +5320,7 @@ ldmud_object_create (object_t* ob)
 {
     ldmud_object_t *self;
 
-    self = (ldmud_object_t *)ldmud_object_type.tp_alloc(&ldmud_object_type, 0);
+    self = (ldmud_object_t *)ldmud_object_type.type_base.tp_alloc(&ldmud_object_type.type_base, 0);
     if (self == NULL)
         return NULL;
 
@@ -2948,6 +5329,29 @@ ldmud_object_create (object_t* ob)
 
     return (PyObject *)self;
 } /* ldmud_object_create() */
+
+/*-------------------------------------------------------------------------*/
+static PyObject*
+ldmud_concrete_object_new (PyTypeObject *type, PyObject *args, PyObject *kwds)
+
+/* Implement __new__ for a ldmud.Object[name].
+ * We ignore the element type here and create a type for generic object instead.
+ */
+
+{
+    PyObject *result = ldmud_object_new(&ldmud_object_type.type_base, args, kwds);
+    if (!result)
+        return NULL;
+
+    /* When returning a different type, we need to initialize that also. */
+    if (ldmud_object_init((ldmud_object_t*)result, args, kwds) < 0)
+    {
+        Py_DECREF(result);
+        return NULL;
+    }
+
+    return result;
+} /* ldmud_concrete_object_new() */
 
 /*-------------------------------------------------------------------------*/
 /* Lightweight Objects */
@@ -2972,7 +5376,7 @@ ldmud_lwobject_dealloc (ldmud_lwobject_t* self)
 static PyObject*
 ldmud_lwobject_new (PyTypeObject *type, PyObject *args, PyObject *kwds)
 
-/* Implmenent __new__ for ldmud_lwobject_t, i.e. allocate and initialize
+/* Implement __new__ for ldmud_lwobject_t, i.e. allocate and initialize
  * the object with null values.
  */
 
@@ -3049,7 +5453,7 @@ ldmud_lwobject_init (ldmud_lwobject_t *self, PyObject *args, PyObject *kwds)
         {
             if(self->lpc_lwobject)
                 free_lwobject(self->lpc_lwobject);
-            self->lpc_lwobject = ref_lwobject(data.lwob);
+            self->lpc_lwobject = data.lwob;
             return 0;
         }
         else
@@ -3091,46 +5495,13 @@ ldmud_lwobject_richcompare (ldmud_lwobject_t *self, PyObject *other, int op)
  */
 
 {
-    lwobject_t *self_ob, *other_ob;
-    bool result;
-    PyObject* resultval;
-
     if (!ldmud_lwobject_check(other))
     {
         Py_INCREF(Py_NotImplemented);
         return Py_NotImplemented;
     }
 
-    self_ob = self->lpc_lwobject;
-    other_ob = ((ldmud_lwobject_t*)other)->lpc_lwobject;
-
-    if(self_ob == NULL && other_ob == NULL)
-        result = op == Py_LE || op == Py_EQ || op == Py_GE;
-    else if(self_ob == NULL)
-        result = op == Py_LT || op == Py_LE || op == Py_NE;
-    else if(other_ob == NULL)
-        result = op == Py_GT || op == Py_GE || op == Py_NE;
-    else
-    {
-        switch (op)
-        {
-            case Py_LT: result = self_ob <  other_ob; break;
-            case Py_LE: result = self_ob <= other_ob; break;
-            case Py_EQ: result = self_ob == other_ob; break;
-            case Py_NE: result = self_ob != other_ob; break;
-            case Py_GT: result = self_ob >  other_ob; break;
-            case Py_GE: result = self_ob >= other_ob; break;
-            default:
-            {
-                Py_INCREF(Py_NotImplemented);
-                return Py_NotImplemented;
-            }
-        }
-    }
-
-    resultval = result ? Py_True : Py_False;
-    Py_INCREF(resultval);
-    return resultval;
+    return pointer_richcompare(self->lpc_lwobject, ((ldmud_lwobject_t*)other)->lpc_lwobject, op);
 } /* ldmud_lwobject_richcompare() */
 
 /*-------------------------------------------------------------------------*/
@@ -3189,6 +5560,17 @@ ldmud_lwobject_get_list (ldmud_lwobject_t *val, PyTypeObject *type)
 } /* ldmud_lwobject_get_list() */
 
 /*-------------------------------------------------------------------------*/
+static lpctype_t*
+ldmud_lwobject_get_lpctype (ldmud_lpctype_t* type)
+
+/* Return the lpctype for ldmud.LWObject.
+ */
+
+{
+    return lpctype_any_lwobject;
+} /* ldmud_lwobject_get_lpctype() */
+
+/*-------------------------------------------------------------------------*/
 static PyNumberMethods ldmud_lwobject_as_number =
 {
     0,                                  /* nb_add */
@@ -3216,9 +5598,9 @@ static PyGetSetDef ldmud_lwobject_getset[] =
     {NULL}
 };
 
-static PyTypeObject ldmud_lwobject_type =
-{
-    PyVarObject_HEAD_INIT(NULL, 0)
+static ldmud_lpctype_t ldmud_lwobject_type =
+{{
+    PyVarObject_HEAD_INIT(&ldmud_any_lwobject_type_type, 0)
     "ldmud.LWObject",                   /* tp_name */
     sizeof(ldmud_lwobject_t),           /* tp_basicsize */
     0,                                  /* tp_itemsize */
@@ -3256,6 +5638,7 @@ static PyTypeObject ldmud_lwobject_type =
     (initproc)ldmud_lwobject_init,      /* tp_init */
     0,                                  /* tp_alloc */
     ldmud_lwobject_new,                 /* tp_new */
+},  ldmud_lwobject_get_lpctype          /* get_lpctype */
 };
 
 /*-------------------------------------------------------------------------*/
@@ -3266,7 +5649,7 @@ ldmud_lwobject_check (PyObject *ob)
  */
 
 {
-    return Py_TYPE(ob) == &ldmud_lwobject_type;
+    return Py_TYPE(ob) == &ldmud_lwobject_type.type_base;
 } /* ldmud_lwobject_check() */
 
 /*-------------------------------------------------------------------------*/
@@ -3279,7 +5662,7 @@ ldmud_lwobject_create (lwobject_t* lwob)
 {
     ldmud_lwobject_t *self;
 
-    self = (ldmud_lwobject_t *)ldmud_lwobject_type.tp_alloc(&ldmud_lwobject_type, 0);
+    self = (ldmud_lwobject_t *)ldmud_lwobject_type.type_base.tp_alloc(&ldmud_lwobject_type.type_base, 0);
     if (self == NULL)
         return NULL;
 
@@ -3288,6 +5671,29 @@ ldmud_lwobject_create (lwobject_t* lwob)
 
     return (PyObject *)self;
 } /* ldmud_lwobject_create() */
+
+/*-------------------------------------------------------------------------*/
+static PyObject*
+ldmud_concrete_lwobject_new (PyTypeObject *type, PyObject *args, PyObject *kwds)
+
+/* Implement __new__ for a ldmud.Object[name].
+ * We ignore the element type here and create a type for generic lwobject instead.
+ */
+
+{
+    PyObject *result = ldmud_lwobject_new(&ldmud_lwobject_type.type_base, args, kwds);
+    if (!result)
+        return NULL;
+
+    /* When returning a different type, we need to initialize that also. */
+    if (ldmud_lwobject_init((ldmud_lwobject_t*)result, args, kwds) < 0)
+    {
+        Py_DECREF(result);
+        return NULL;
+    }
+
+    return result;
+} /* ldmud_concrete_lwobject_new() */
 
 /*-------------------------------------------------------------------------*/
 /* Arrays */
@@ -3314,7 +5720,7 @@ ldmud_array_dealloc (ldmud_array_t* self)
 static PyObject*
 ldmud_array_new (PyTypeObject *type, PyObject *args, PyObject *kwds)
 
-/* Implmenent __new__ for ldmud_array_t, i.e. allocate and initialize
+/* Implement __new__ for ldmud_array_t, i.e. allocate and initialize
  * the array with null values.
  */
 
@@ -3906,6 +6312,17 @@ ldmud_array_ass_sub (ldmud_array_t *val, PyObject *key, PyObject *value)
 } /* ldmud_array_ass_sub() */
 
 /*-------------------------------------------------------------------------*/
+static lpctype_t*
+ldmud_array_get_lpctype (ldmud_lpctype_t* type)
+
+/* Return the lpctype for ldmud.Array.
+ */
+
+{
+    return lpctype_any_array;
+} /* ldmud_array_get_lpctype() */
+
+/*-------------------------------------------------------------------------*/
 static PySequenceMethods ldmud_array_as_sequence = {
     (lenfunc)ldmud_array_length,                /* sq_length */
     (binaryfunc)ldmud_array_concat,             /* sq_concat */
@@ -3933,11 +6350,9 @@ static PyMethodDef ldmud_array_methods[] =
     {NULL}
 };
 
-
-
-static PyTypeObject ldmud_array_type =
-{
-    PyVarObject_HEAD_INIT(NULL, 0)
+static ldmud_lpctype_t ldmud_array_type =
+{{
+    PyVarObject_HEAD_INIT(&ldmud_any_array_type_type, 0)
     "ldmud.Array",                      /* tp_name */
     sizeof(ldmud_array_t),              /* tp_basicsize */
     0,                                  /* tp_itemsize */
@@ -3975,6 +6390,7 @@ static PyTypeObject ldmud_array_type =
     (initproc)ldmud_array_init,         /* tp_init */
     0,                                  /* tp_alloc */
     ldmud_array_new,                    /* tp_new */
+},  ldmud_array_get_lpctype             /* get_lpctype */
 };
 
 /*-------------------------------------------------------------------------*/
@@ -3985,7 +6401,7 @@ ldmud_array_check (PyObject *ob)
  */
 
 {
-    return Py_TYPE(ob) == &ldmud_array_type;
+    return Py_TYPE(ob) == &ldmud_array_type.type_base;
 } /* ldmud_array_check() */
 
 /*-------------------------------------------------------------------------*/
@@ -3998,7 +6414,7 @@ ldmud_array_create (vector_t* vec)
 {
     ldmud_array_t *self;
 
-    self = (ldmud_array_t *)ldmud_array_type.tp_alloc(&ldmud_array_type, 0);
+    self = (ldmud_array_t *)ldmud_array_type.type_base.tp_alloc(&ldmud_array_type.type_base, 0);
     if (self == NULL)
         return NULL;
 
@@ -4009,6 +6425,29 @@ ldmud_array_create (vector_t* vec)
 
     return (PyObject *)self;
 } /* ldmud_array_create() */
+
+/*-------------------------------------------------------------------------*/
+static PyObject*
+ldmud_concrete_array_new (PyTypeObject *type, PyObject *args, PyObject *kwds)
+
+/* Implement __new__ for a ldmud.Array[element type].
+ * We ignore the element type here and create a type for generic array instead.
+ */
+
+{
+    PyObject *result = ldmud_array_new(&ldmud_array_type.type_base, args, kwds);
+    if (!result)
+        return NULL;
+
+    /* When returning a different type, we need to initialize that also. */
+    if (ldmud_array_init((ldmud_array_t*)result, args, kwds) < 0)
+    {
+        Py_DECREF(result);
+        return NULL;
+    }
+
+    return result;
+} /* ldmud_concrete_array_new() */
 
 /*-------------------------------------------------------------------------*/
 /* Mappings */
@@ -4426,7 +6865,7 @@ ldmud_mapping_dealloc (ldmud_mapping_t* self)
 static PyObject*
 ldmud_mapping_new (PyTypeObject *type, PyObject *args, PyObject *kwds)
 
-/* Implmenent __new__ for ldmud_mapping_t, i.e. allocate and initialize
+/* Implement __new__ for ldmud_mapping_t, i.e. allocate and initialize
  * the mapping as an empty one (with width 1).
  */
 
@@ -5004,6 +7443,17 @@ ldmud_mapping_get_width (ldmud_mapping_t *val, void *closure)
 } /* ldmud_mapping_get_width() */
 
 /*-------------------------------------------------------------------------*/
+static lpctype_t*
+ldmud_mapping_get_lpctype (ldmud_lpctype_t* type)
+
+/* Return the lpctype for ldmud.Mapping.
+ */
+
+{
+    return lpctype_mapping;
+} /* ldmud_mapping_get_lpctype() */
+
+/*-------------------------------------------------------------------------*/
 
 /* This is needed for 'in' functionality. */
 static PySequenceMethods ldmud_mapping_as_sequence = {
@@ -5059,9 +7509,9 @@ static PyGetSetDef ldmud_mapping_getset [] = {
 };
 
 
-static PyTypeObject ldmud_mapping_type =
-{
-    PyVarObject_HEAD_INIT(NULL, 0)
+static ldmud_lpctype_t ldmud_mapping_type =
+{{
+    PyVarObject_HEAD_INIT(&ldmud_lpctype_type.type_base, 0)
     "ldmud.Mapping",                    /* tp_name */
     sizeof(ldmud_mapping_t),            /* tp_basicsize */
     0,                                  /* tp_itemsize */
@@ -5099,6 +7549,7 @@ static PyTypeObject ldmud_mapping_type =
     (initproc)ldmud_mapping_init,       /* tp_init */
     0,                                  /* tp_alloc */
     ldmud_mapping_new,                  /* tp_new */
+},  ldmud_mapping_get_lpctype           /* get_lpctype */
 };
 
 /*-------------------------------------------------------------------------*/
@@ -5109,7 +7560,7 @@ ldmud_mapping_check (PyObject *ob)
  */
 
 {
-    return Py_TYPE(ob) == &ldmud_mapping_type;
+    return Py_TYPE(ob) == &ldmud_mapping_type.type_base;
 } /* ldmud_mapping_check() */
 
 /*-------------------------------------------------------------------------*/
@@ -5122,7 +7573,7 @@ ldmud_mapping_create (mapping_t* map)
 {
     ldmud_mapping_t *self;
 
-    self = (ldmud_mapping_t *)ldmud_mapping_type.tp_alloc(&ldmud_mapping_type, 0);
+    self = (ldmud_mapping_t *)ldmud_mapping_type.type_base.tp_alloc(&ldmud_mapping_type.type_base, 0);
     if (self == NULL)
         return NULL;
 
@@ -5546,7 +7997,7 @@ ldmud_struct_dealloc (ldmud_struct_t* self)
 static PyObject*
 ldmud_struct_new (PyTypeObject *type, PyObject *args, PyObject *kwds)
 
-/* Implmenent __new__ for ldmud_struct_t, i.e. allocate and initialize
+/* Implement __new__ for ldmud_struct_t, i.e. allocate and initialize
  * the struct with null values.
  */
 
@@ -5564,68 +8015,21 @@ ldmud_struct_new (PyTypeObject *type, PyObject *args, PyObject *kwds)
 } /* ldmud_struct_new() */
 
 /*-------------------------------------------------------------------------*/
-static int
-ldmud_struct_init (ldmud_struct_t *self, PyObject *args, PyObject *kwds)
+static bool
+ldmud_struct_init_values (ldmud_struct_t *self,  struct_type_t *lpc_struct_type, PyObject *values)
 
-/* Implement __init__ for ldmud_struct_t, i.e. create a new struct object
- * from the given arguments.
+/* Helper function for __init__ to initialize the struct <self> with
+ * the given type and values. Returns true for success, false (with
+ * a Python exception) otherwise.
  */
 
 {
-    /* We expect:
-     *  - the object whose struct definition it is
-     *  - the name of the struct
-     *  - (optional) the values for the struct, given either as a tuple/list
-     *    or map.
-     */
-
-    static char *kwlist[] = { "object", "name", "values", NULL};
-
-    PyObject *ob, *values;
-    const char* name;
-    Py_ssize_t length;
-
-    object_t *lpc_ob;
-    struct_t *lpc_struct;
-    string_t *lpc_struct_name;
-    struct_type_t *lpc_struct_type;
-
-    values = NULL;
-    if (! PyArg_ParseTupleAndKeywords(args, kwds, "O!s#|O", kwlist,
-                                      &ldmud_object_type, &ob, &name, &length, &values))
-        return -1;
-
-    /* Lookup the object (we really only need the program). */
-    lpc_ob = ((ldmud_object_t*)ob)->lpc_object;
-    if(!lpc_ob)
-    {
-        PyErr_SetString(PyExc_TypeError, "uninitialized lpc object");
-        return -1;
-    }
-
-    if (O_PROG_SWAPPED(lpc_ob) && load_ob_from_swap(lpc_ob) < 0)
-    {
-        PyErr_SetString(PyExc_MemoryError, "out of memory while unswapping");
-        return -1;
-    }
-
-    /* Lookup the struct type. */
-    /* TODO: This lookup also includes NAME_HIDDEN entries, maybe only consider visible structs. */
-    lpc_struct_name = find_tabled_str_n(name, length, STRING_UTF8);
-    lpc_struct_type = lpc_struct_name ? struct_find(lpc_struct_name, lpc_ob->prog) : NULL;
-
-    if(!lpc_struct_type)
-    {
-        PyErr_Format(PyExc_NameError, "unknown struct '%s'", name);
-        return -1;
-    }
-
     /* Create the new struct. */
-    lpc_struct = struct_new(lpc_struct_type);
+    struct_t *lpc_struct = struct_new(lpc_struct_type);
     if(!lpc_struct)
     {
         PyErr_SetString(PyExc_MemoryError, "Out of memory");
-        return -1;
+        return false;
     }
 
     /* Now let's have a look if there are any members to initialize. */
@@ -5645,7 +8049,7 @@ ldmud_struct_init (ldmud_struct_t *self, PyObject *args, PyObject *kwds)
             if (items == NULL)
             {
                 free_struct(lpc_struct);
-                return -1;
+                return false;
             }
 
             iterator = PyObject_GetIter(items);
@@ -5654,7 +8058,7 @@ ldmud_struct_init (ldmud_struct_t *self, PyObject *args, PyObject *kwds)
             if(iterator == NULL)
             {
                 free_struct(lpc_struct);
-                return -1;
+                return false;
             }
 
             while ((item = PyIter_Next(iterator)))
@@ -5750,7 +8154,7 @@ ldmud_struct_init (ldmud_struct_t *self, PyObject *args, PyObject *kwds)
             {
                 /* PyObject_GetIter will set an exception. */
                 free_struct(lpc_struct);
-                return -1;
+                return false;
             }
 
             while ((item = PyIter_Next(iterator)))
@@ -5781,7 +8185,7 @@ ldmud_struct_init (ldmud_struct_t *self, PyObject *args, PyObject *kwds)
         if (PyErr_Occurred())
         {
             free_struct(lpc_struct);
-            return -1;
+            return false;
         }
     }
 
@@ -5789,7 +8193,66 @@ ldmud_struct_init (ldmud_struct_t *self, PyObject *args, PyObject *kwds)
         free_struct(self->lpc_struct);
     self->lpc_struct = lpc_struct;
 
-    return 0;
+    return true;
+} /* ldmud_struct_init_values() */
+
+/*-------------------------------------------------------------------------*/
+static int
+ldmud_struct_init (ldmud_struct_t *self, PyObject *args, PyObject *kwds)
+
+/* Implement __init__ for ldmud_struct_t, i.e. create a new struct object
+ * from the given arguments.
+ */
+
+{
+    /* We expect:
+     *  - the object whose struct definition it is
+     *  - the name of the struct
+     *  - (optional) the values for the struct, given either as a tuple/list
+     *    or map.
+     */
+
+    static char *kwlist[] = { "object", "name", "values", NULL};
+
+    PyObject *ob, *values;
+    const char* name;
+    Py_ssize_t length;
+
+    object_t *lpc_ob;
+    string_t *lpc_struct_name;
+    struct_type_t *lpc_struct_type;
+
+    values = NULL;
+    if (! PyArg_ParseTupleAndKeywords(args, kwds, "O!s#|O", kwlist,
+                                      &ldmud_object_type, &ob, &name, &length, &values))
+        return -1;
+
+    /* Lookup the object (we really only need the program). */
+    lpc_ob = ((ldmud_object_t*)ob)->lpc_object;
+    if(!lpc_ob)
+    {
+        PyErr_SetString(PyExc_TypeError, "uninitialized lpc object");
+        return -1;
+    }
+
+    if (O_PROG_SWAPPED(lpc_ob) && load_ob_from_swap(lpc_ob) < 0)
+    {
+        PyErr_SetString(PyExc_MemoryError, "out of memory while unswapping");
+        return -1;
+    }
+
+    /* Lookup the struct type. */
+    /* TODO: This lookup also includes NAME_HIDDEN entries, maybe only consider visible structs. */
+    lpc_struct_name = find_tabled_str_n(name, length, STRING_UTF8);
+    lpc_struct_type = lpc_struct_name ? struct_find(lpc_struct_name, lpc_ob->prog) : NULL;
+
+    if(!lpc_struct_type)
+    {
+        PyErr_Format(PyExc_NameError, "unknown struct '%s'", name);
+        return -1;
+    }
+
+    return ldmud_struct_init_values(self, lpc_struct_type, values) ? 0 : -1;
 } /* ldmud_struct_init() */
 
 /*-------------------------------------------------------------------------*/
@@ -5875,6 +8338,17 @@ ldmud_struct_get_members (ldmud_struct_t *self, void *closure)
 } /* ldmud_struct_get_members() */
 
 /*-------------------------------------------------------------------------*/
+static lpctype_t*
+ldmud_struct_get_lpctype (ldmud_lpctype_t* type)
+
+/* Return the lpctype for ldmud.Struct.
+ */
+
+{
+    return lpctype_any_struct;
+} /* ldmud_struct_get_lpctype() */
+
+/*-------------------------------------------------------------------------*/
 static PyMethodDef ldmud_struct_methods[] =
 {
     {NULL}
@@ -5888,9 +8362,9 @@ static PyGetSetDef ldmud_struct_getset[] =
     {NULL}
 };
 
-static PyTypeObject ldmud_struct_type =
-{
-    PyVarObject_HEAD_INIT(NULL, 0)
+static ldmud_lpctype_t ldmud_struct_type =
+{{
+    PyVarObject_HEAD_INIT(&ldmud_any_struct_type_type, 0)
     "ldmud.Struct",                     /* tp_name */
     sizeof(ldmud_struct_t),             /* tp_basicsize */
     0,                                  /* tp_itemsize */
@@ -5928,7 +8402,62 @@ static PyTypeObject ldmud_struct_type =
     (initproc)ldmud_struct_init,        /* tp_init */
     0,                                  /* tp_alloc */
     ldmud_struct_new,                   /* tp_new */
+},  ldmud_struct_get_lpctype            /* get_lpctype */
 };
+
+static PyObject*
+ldmud_concrete_struct_new (PyTypeObject *type, PyObject *args, PyObject *kwds)
+
+/* Implement __new__ for a ldmud.Struct[program name, struct name].
+ * We're using the information from the type to construct the struct.
+ */
+
+{
+    static char *kwlist[] = { "values", NULL};
+
+    struct_name_t *name = ((ldmud_concrete_struct_type_t*)type)->name;
+    struct_type_t *stype = name->current;
+    PyObject *values = NULL;
+
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "|O", kwlist, &values))
+        return NULL;
+
+    if (!name->current)
+    {
+        /* We don't have a current struct definition.
+         * So we need to load the program to get that definition.
+         */
+        struct ldmud_object_init_closure_s data = { name->prog_name, NULL };
+        if (!call_lpc_secure((CClosureFun)ldmud_object_init_getobject, 0, &data))
+            return NULL;
+
+        if (!data.ob)
+        {
+            PyErr_Format(PyExc_ValueError, "could not load '%s'", get_txt(name->prog_name));
+            return NULL;
+        }
+
+        stype = struct_find(name->name, data.ob->prog);
+        if (!stype)
+        {
+            PyErr_Format(PyExc_ValueError, "unknown struct '%s'", get_txt(name->name));
+            return NULL;
+        }
+    }
+
+    PyObject *result = ldmud_struct_new(&ldmud_struct_type.type_base, args, kwds);
+    if (!result)
+        return NULL;
+
+    /* When returning a different type, we need to initialize that also. */
+    if (!ldmud_struct_init_values((ldmud_struct_t*) result, stype, values))
+    {
+        Py_DECREF(result);
+        return NULL;
+    }
+
+    return result;
+} /* ldmud_concrete_struct_new() */
 
 /*-------------------------------------------------------------------------*/
 /* Closures */
@@ -5951,7 +8480,7 @@ ldmud_closure_dealloc (ldmud_closure_t* self)
 static PyObject*
 ldmud_closure_new (PyTypeObject *type, PyObject *args, PyObject *kwds)
 
-/* Implmenent __new__ for ldmud_closure_t, i.e. allocate and initialize
+/* Implement __new__ for ldmud_closure_t, i.e. allocate and initialize
  * the closure with null values.
  */
 
@@ -5999,7 +8528,7 @@ ldmud_closure_init (ldmud_closure_t *self, PyObject *args, PyObject *kwds)
                                       &lfun_ob))
         return -1;
 
-    if (PyObject_TypeCheck(bound_ob, &ldmud_object_type))
+    if (PyObject_TypeCheck(bound_ob, &ldmud_object_type.type_base))
     {
         object_t *ob = ((ldmud_object_t*)bound_ob)->lpc_object;
         if (!ob)
@@ -6009,7 +8538,7 @@ ldmud_closure_init (ldmud_closure_t *self, PyObject *args, PyObject *kwds)
         }
         sv_bound_ob = svalue_object(ob);
     }
-    else if (PyObject_TypeCheck(bound_ob, &ldmud_lwobject_type))
+    else if (PyObject_TypeCheck(bound_ob, &ldmud_lwobject_type.type_base))
     {
         lwobject_t *lwob = ((ldmud_lwobject_t*)bound_ob)->lpc_lwobject;
         if (!lwob)
@@ -6026,7 +8555,7 @@ ldmud_closure_init (ldmud_closure_t *self, PyObject *args, PyObject *kwds)
     }
 
     if (lfun_ob == NULL) {}
-    else if (PyObject_TypeCheck(lfun_ob, &ldmud_object_type))
+    else if (PyObject_TypeCheck(lfun_ob, &ldmud_object_type.type_base))
     {
         object_t *ob = ((ldmud_object_t*)lfun_ob)->lpc_object;
         if (!ob)
@@ -6037,7 +8566,7 @@ ldmud_closure_init (ldmud_closure_t *self, PyObject *args, PyObject *kwds)
         sv_lfun_ob = svalue_object(ob);
         prog = ob->prog;
     }
-    else if (PyObject_TypeCheck(lfun_ob, &ldmud_lwobject_type))
+    else if (PyObject_TypeCheck(lfun_ob, &ldmud_lwobject_type.type_base))
     {
         lwobject_t *lwob = ((ldmud_lwobject_t*)lfun_ob)->lpc_lwobject;
         if (!lwob)
@@ -6083,6 +8612,7 @@ ldmud_closure_init (ldmud_closure_t *self, PyObject *args, PyObject *kwds)
                 PyErr_SetString(PyExc_MemoryError, "out of memory while unswapping");
                 return -1;
             }
+            prog = sv_lfun_ob.u.ob->prog;
         }
 
         funname = find_tabled_str_n(name, length, STRING_UTF8);
@@ -6104,8 +8634,8 @@ ldmud_closure_init (ldmud_closure_t *self, PyObject *args, PyObject *kwds)
             return -1;
         }
 
-        /* The lambda was bound to the wrong object */
-        assign_object_svalue(&(self->lpc_closure.u.lambda->ob), sv_bound_ob, "ldmud_closure_init");
+        /* The closure was bound to the wrong object */
+        assign_object_svalue(&(self->lpc_closure.u.lfun_closure->base.ob), sv_bound_ob, "ldmud_closure_init");
 
         return 0;
     }
@@ -6131,9 +8661,9 @@ ldmud_closure_hash (ldmud_closure_t *val)
         return _Py_HashPointer(val->lpc_closure.u.lambda) ^ closure_type;
     /* Lfun or identifier closures. */
     if (CLOSURE_MALLOCED(closure_type))
-        return (val->lpc_closure.u.lambda->ob.type == T_OBJECT
-                ? _Py_HashPointer(val->lpc_closure.u.lambda->ob.u.ob)
-                : _Py_HashPointer(val->lpc_closure.u.lambda->ob.u.lwob)) ^ closure_type;
+        return (val->lpc_closure.u.closure->ob.type == T_OBJECT
+                ? _Py_HashPointer(val->lpc_closure.u.closure->ob.u.ob)
+                : _Py_HashPointer(val->lpc_closure.u.closure->ob.u.lwob)) ^ closure_type;
     /* Efun, simul-efun or operator closure. */
     return closure_type;
 } /* ldmud_closure_hash() */
@@ -6280,6 +8810,17 @@ ldmud_closure_call (ldmud_closure_t *cl, PyObject *arg, PyObject *kw)
 } /* ldmud_closure_call() */
 
 /*-------------------------------------------------------------------------*/
+static lpctype_t*
+ldmud_closure_get_lpctype (ldmud_lpctype_t* type)
+
+/* Return the lpctype for ldmud.Closure.
+ */
+
+{
+    return lpctype_closure;
+} /* ldmud_closure_get_lpctype() */
+
+/*-------------------------------------------------------------------------*/
 static PyNumberMethods ldmud_closure_as_number =
 {
     0,                                  /* nb_add */
@@ -6304,9 +8845,9 @@ static PyGetSetDef ldmud_closure_getset[] =
     {NULL}
 };
 
-static PyTypeObject ldmud_closure_type =
-{
-    PyVarObject_HEAD_INIT(NULL, 0)
+static ldmud_lpctype_t ldmud_closure_type =
+{{
+    PyVarObject_HEAD_INIT(&ldmud_lpctype_type.type_base, 0)
     "ldmud.Closure",                    /* tp_name */
     sizeof(ldmud_closure_t),            /* tp_basicsize */
     0,                                  /* tp_itemsize */
@@ -6344,6 +8885,7 @@ static PyTypeObject ldmud_closure_type =
     (initproc)ldmud_closure_init,       /* tp_init */
     0,                                  /* tp_alloc */
     ldmud_closure_new,                  /* tp_new */
+},  ldmud_closure_get_lpctype           /* get_lpctype */
 };
 
 
@@ -6355,7 +8897,7 @@ ldmud_closure_check (PyObject *ob)
  */
 
 {
-    return Py_TYPE(ob) == &ldmud_closure_type;
+    return Py_TYPE(ob) == &ldmud_closure_type.type_base;
 } /* ldmud_closure_check() */
 
 /*-------------------------------------------------------------------------*/
@@ -6368,7 +8910,7 @@ ldmud_closure_create (svalue_t* cl)
 {
     ldmud_closure_t *self;
 
-    self = (ldmud_closure_t *)ldmud_closure_type.tp_alloc(&ldmud_closure_type, 0);
+    self = (ldmud_closure_t *)ldmud_closure_type.type_base.tp_alloc(&ldmud_closure_type.type_base, 0);
     if (self == NULL)
         return NULL;
 
@@ -6685,7 +9227,7 @@ static PyTypeObject ldmud_coroutine_variables_type =
 static PyObject*
 ldmud_coroutine_new (PyTypeObject *type, PyObject *args, PyObject *kwds)
 
-/* Implmenent __new__ for ldmud_coroutine_t, i.e. allocate and initialize
+/* Implement __new__ for ldmud_coroutine_t, i.e. allocate and initialize
  * the coroutine with null values.
  */
 
@@ -6750,46 +9292,13 @@ ldmud_coroutine_richcompare (ldmud_coroutine_t *self, PyObject *other, int op)
  */
 
 {
-    coroutine_t *self_cr, *other_cr;
-    bool result;
-    PyObject* resultval;
-
     if (!ldmud_coroutine_check(other))
     {
         Py_INCREF(Py_NotImplemented);
         return Py_NotImplemented;
     }
 
-    self_cr = self->lpc_coroutine;
-    other_cr = ((ldmud_coroutine_t*)other)->lpc_coroutine;
-
-    if(self_cr == NULL && other_cr == NULL)
-        result = op == Py_LE || op == Py_EQ || op == Py_GE;
-    else if(self_cr == NULL)
-        result = op == Py_LT || op == Py_LE || op == Py_NE;
-    else if(other_cr == NULL)
-        result = op == Py_GT || op == Py_GE || op == Py_NE;
-    else
-    {
-        switch (op)
-        {
-            case Py_LT: result = self_cr <  other_cr; break;
-            case Py_LE: result = self_cr <= other_cr; break;
-            case Py_EQ: result = self_cr == other_cr; break;
-            case Py_NE: result = self_cr != other_cr; break;
-            case Py_GT: result = self_cr >  other_cr; break;
-            case Py_GE: result = self_cr >= other_cr; break;
-            default:
-            {
-                Py_INCREF(Py_NotImplemented);
-                return Py_NotImplemented;
-            }
-        }
-    }
-
-    resultval = result ? Py_True : Py_False;
-    Py_INCREF(resultval);
-    return resultval;
+    return pointer_richcompare(self->lpc_coroutine, ((ldmud_coroutine_t*)other)->lpc_coroutine, op);
 } /* ldmud_coroutine_richcompare() */
 
 /*-------------------------------------------------------------------------*/
@@ -7037,6 +9546,17 @@ ldmud_coroutine_call (ldmud_coroutine_t *cr, PyObject *arg, PyObject *kw)
 } /* ldmud_coroutine_call() */
 
 /*-------------------------------------------------------------------------*/
+static lpctype_t*
+ldmud_coroutine_get_lpctype (ldmud_lpctype_t* type)
+
+/* Return the lpctype for ldmud.Coroutine.
+ */
+
+{
+    return lpctype_coroutine;
+} /* ldmud_coroutine_get_lpctype() */
+
+/*-------------------------------------------------------------------------*/
 static PyNumberMethods ldmud_coroutine_as_number =
 {
     0,                                  /* nb_add */
@@ -7067,9 +9587,9 @@ static PyGetSetDef ldmud_coroutine_getset[] =
     {NULL}
 };
 
-static PyTypeObject ldmud_coroutine_type =
-{
-    PyVarObject_HEAD_INIT(NULL, 0)
+static ldmud_lpctype_t ldmud_coroutine_type =
+{{
+    PyVarObject_HEAD_INIT(&ldmud_lpctype_type.type_base, 0)
     "ldmud.Coroutine",                  /* tp_name */
     sizeof(ldmud_coroutine_t),          /* tp_basicsize */
     0,                                  /* tp_itemsize */
@@ -7107,6 +9627,7 @@ static PyTypeObject ldmud_coroutine_type =
     0,                                  /* tp_init */
     0,                                  /* tp_alloc */
     ldmud_coroutine_new,                /* tp_new */
+},  ldmud_coroutine_get_lpctype         /* get_lpctype */
 };
 
 
@@ -7118,7 +9639,7 @@ ldmud_coroutine_check (PyObject *ob)
  */
 
 {
-    return Py_TYPE(ob) == &ldmud_coroutine_type;
+    return Py_TYPE(ob) == &ldmud_coroutine_type.type_base;
 } /* ldmud_coroutine_check() */
 
 /*-------------------------------------------------------------------------*/
@@ -7131,7 +9652,7 @@ ldmud_coroutine_create (coroutine_t* cr)
 {
     ldmud_coroutine_t *self;
 
-    self = (ldmud_coroutine_t *)ldmud_coroutine_type.tp_alloc(&ldmud_coroutine_type, 0);
+    self = (ldmud_coroutine_t *)ldmud_coroutine_type.type_base.tp_alloc(&ldmud_coroutine_type.type_base, 0);
     if (self == NULL)
         return NULL;
 
@@ -7163,7 +9684,7 @@ ldmud_symbol_dealloc (ldmud_symbol_t* self)
 static PyObject*
 ldmud_symbol_new (PyTypeObject *type, PyObject *args, PyObject *kwds)
 
-/* Implmenent __new__ for ldmud_symbol_t, i.e. allocate and initialize
+/* Implement __new__ for ldmud_symbol_t, i.e. allocate and initialize
  * the symbol with null values.
  */
 
@@ -7323,6 +9844,17 @@ ldmud_symbol_get_quotes (ldmud_symbol_t *val, void *closure)
 } /* ldmud_symbol_get_quotes() */
 
 /*-------------------------------------------------------------------------*/
+static lpctype_t*
+ldmud_symbol_get_lpctype (ldmud_lpctype_t* type)
+
+/* Return the lpctype for ldmud.Symbol.
+ */
+
+{
+    return lpctype_symbol;
+} /* ldmud_symbol_get_lpctype() */
+
+/*-------------------------------------------------------------------------*/
 static PyMethodDef ldmud_symbol_methods[] =
 {
     {NULL}
@@ -7335,9 +9867,9 @@ static PyGetSetDef ldmud_symbol_getset[] =
     {NULL}
 };
 
-static PyTypeObject ldmud_symbol_type =
-{
-    PyVarObject_HEAD_INIT(NULL, 0)
+static ldmud_lpctype_t ldmud_symbol_type =
+{{
+    PyVarObject_HEAD_INIT(&ldmud_lpctype_type.type_base, 0)
     "ldmud.Symbol",                     /* tp_name */
     sizeof(ldmud_symbol_t),             /* tp_basicsize */
     0,                                  /* tp_itemsize */
@@ -7375,6 +9907,7 @@ static PyTypeObject ldmud_symbol_type =
     (initproc)ldmud_symbol_init,        /* tp_init */
     0,                                  /* tp_alloc */
     ldmud_symbol_new,                   /* tp_new */
+},  ldmud_symbol_get_lpctype            /* get_lpctype */
 };
 
 
@@ -7386,7 +9919,7 @@ ldmud_symbol_check (PyObject *ob)
  */
 
 {
-    return Py_TYPE(ob) == &ldmud_symbol_type;
+    return Py_TYPE(ob) == &ldmud_symbol_type.type_base;
 } /* ldmud_symbol_check() */
 
 /*-------------------------------------------------------------------------*/
@@ -7399,7 +9932,7 @@ ldmud_symbol_create (svalue_t* sym)
 {
     ldmud_symbol_t *self;
 
-    self = (ldmud_symbol_t *)ldmud_symbol_type.tp_alloc(&ldmud_symbol_type, 0);
+    self = (ldmud_symbol_t *)ldmud_symbol_type.type_base.tp_alloc(&ldmud_symbol_type.type_base, 0);
     if (self == NULL)
         return NULL;
 
@@ -7431,7 +9964,7 @@ ldmud_quoted_array_dealloc (ldmud_quoted_array_t* self)
 static PyObject*
 ldmud_quoted_array_new (PyTypeObject *type, PyObject *args, PyObject *kwds)
 
-/* Implmenent __new__ for ldmud_quoted_array_t, i.e. allocate and initialize
+/* Implement __new__ for ldmud_quoted_array_t, i.e. allocate and initialize
  * the quoted_array with null values.
  */
 
@@ -7540,6 +10073,17 @@ ldmud_quoted_array_get_quotes (ldmud_quoted_array_t *val, void *closure)
 } /* ldmud_quoted_array_get_quotes() */
 
 /*-------------------------------------------------------------------------*/
+static lpctype_t*
+ldmud_quoted_array_get_lpctype (ldmud_lpctype_t* type)
+
+/* Return the lpctype for ldmud.QuotedArray.
+ */
+
+{
+    return lpctype_quoted_array;
+} /* ldmud_quoted_array_get_lpctype() */
+
+/*-------------------------------------------------------------------------*/
 static PyMethodDef ldmud_quoted_array_methods[] =
 {
     {NULL}
@@ -7552,9 +10096,9 @@ static PyGetSetDef ldmud_quoted_array_getset[] =
     {NULL}
 };
 
-static PyTypeObject ldmud_quoted_array_type =
-{
-    PyVarObject_HEAD_INIT(NULL, 0)
+static ldmud_lpctype_t ldmud_quoted_array_type =
+{{
+    PyVarObject_HEAD_INIT(&ldmud_lpctype_type.type_base, 0)
     "ldmud.QuotedArray",                /* tp_name */
     sizeof(ldmud_quoted_array_t),       /* tp_basicsize */
     0,                                  /* tp_itemsize */
@@ -7592,6 +10136,7 @@ static PyTypeObject ldmud_quoted_array_type =
     (initproc)ldmud_quoted_array_init,  /* tp_init */
     0,                                  /* tp_alloc */
     ldmud_quoted_array_new,             /* tp_new */
+},  ldmud_quoted_array_get_lpctype      /* get_lpctype */
 };
 
 
@@ -7603,7 +10148,7 @@ ldmud_quoted_array_check (PyObject *ob)
  */
 
 {
-    return Py_TYPE(ob) == &ldmud_quoted_array_type;
+    return Py_TYPE(ob) == &ldmud_quoted_array_type.type_base;
 } /* ldmud_quoted_array_check() */
 
 /*-------------------------------------------------------------------------*/
@@ -7616,7 +10161,7 @@ ldmud_quoted_array_create (svalue_t* sym)
 {
     ldmud_quoted_array_t *self;
 
-    self = (ldmud_quoted_array_t *)ldmud_quoted_array_type.tp_alloc(&ldmud_quoted_array_type, 0);
+    self = (ldmud_quoted_array_t *)ldmud_quoted_array_type.type_base.tp_alloc(&ldmud_quoted_array_type.type_base, 0);
     if (self == NULL)
         return NULL;
 
@@ -7788,7 +10333,7 @@ ldmud_lvalue_dealloc (ldmud_lvalue_t* self)
 static PyObject*
 ldmud_lvalue_new (PyTypeObject *type, PyObject *args, PyObject *kwds)
 
-/* Implmenent __new__ for ldmud_lvalue_t, i.e. allocate and initialize
+/* Implement __new__ for ldmud_lvalue_t, i.e. allocate and initialize
  * the lvalue with null values.
  */
 
@@ -8034,7 +10579,7 @@ ldmud_lvalue_item (ldmud_lvalue_t *self, Py_ssize_t idx)
                     }
 
                     default:
-                        fatal("Illegal type for range lvalue '%s'.\n", typename(r->vec.type));
+                        fatal("Illegal type for range lvalue '%s'.\n", sv_typename(&(r->vec)));
                 }
             }
 
@@ -8725,6 +11270,229 @@ ldmud_lvalue_create (svalue_t* lv)
 } /* ldmud_lvalue_create() */
 
 /*-------------------------------------------------------------------------*/
+/* Mixed */
+
+/*-------------------------------------------------------------------------*/
+static PyObject*
+ldmud_mixed_new (PyTypeObject *type, PyObject *args, PyObject *kwds)
+
+/* Implement __new__ for the mixed type. This is a No-op for any value
+ * that is already of an lpc type. For any other values we try to
+ * convert. This is basically doing svalue_to_python(python_to_svalue(arg)).
+ * We will never actually create an object of the mixed type.
+ */
+
+{
+    static char *kwlist[] = { "value", NULL};
+    ldmud_lpctype_t *internal_type;
+    PyObject *internal_type_arg;
+
+    PyObject *value;
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "O", kwlist, &value))
+        return NULL;
+
+    /* Check if <value> is of an lpctype. */
+    PyTypeObject *valuetype = Py_TYPE(value);
+    PyObject *mro = valuetype->tp_mro;
+    if (mro && PyTuple_Check(mro))
+    {
+        for (Py_ssize_t i = 0, n = PyTuple_GET_SIZE(mro); i < n; i++)
+        {
+            if (PyObject_TypeCheck(PyTuple_GET_ITEM(mro, i), &ldmud_lpctype_type.type_base))
+            {
+                Py_INCREF(value);
+                return value;
+            }
+        }
+    }
+
+    /* Is it one of the registered types? */
+    for (int idx = 0; idx < PYTHON_TYPE_TABLE_SIZE; idx++)
+    {
+        if (python_type_table[idx] != NULL
+         && python_type_table[idx]->pytype != NULL
+         && PyObject_TypeCheck(value, (PyTypeObject*) python_type_table[idx]->pytype))
+        {
+            Py_INCREF(value);
+            return value;
+        }
+    }
+
+    /* Last chance: native Python types. */
+    if (PyLong_Check(value))
+    {
+        int overflow;
+        long num = PyLong_AsLongAndOverflow(value, &overflow);
+
+        if (overflow || num < PINT_MIN || num > PINT_MAX)
+        {
+            PyErr_SetString(PyExc_OverflowError, "integer overflow");
+            return NULL;
+        }
+
+        internal_type = &ldmud_integer_type;
+        internal_type_arg = value;
+        Py_INCREF(value);
+    }
+    else if (PyBool_Check(value))
+    {
+        internal_type = &ldmud_integer_type;
+        internal_type_arg = PyLong_FromLong(value == Py_True ? 1 : 0);
+    }
+    else if (PyFloat_Check(value))
+    {
+        internal_type = &ldmud_float_type;
+        internal_type_arg = value;
+        Py_INCREF(value);
+    }
+    else if (PyBytes_Check(value))
+    {
+        internal_type = &ldmud_bytes_type;
+        internal_type_arg = value;
+        Py_INCREF(value);
+    }
+    else if (PyUnicode_Check(value))
+    {
+        internal_type = &ldmud_string_type;
+        internal_type_arg = value;
+        Py_INCREF(value);
+    }
+    else
+        internal_type = NULL;
+
+    if (internal_type)
+    {
+        PyObject *type_args = PyTuple_New(1);
+        PyObject *result;
+
+        if (type_args == NULL)
+            return NULL;
+        PyTuple_SET_ITEM(type_args, 0, internal_type_arg);
+        result = PyObject_CallObject((PyObject *)internal_type, type_args);
+        Py_DECREF(type_args);
+        return result;
+    }
+
+    PyErr_Format(PyExc_TypeError, "unsupported type '%.200s'", valuetype->tp_name);
+    return NULL;
+} /* ldmud_mixed_new() */
+
+/*-------------------------------------------------------------------------*/
+static lpctype_t*
+ldmud_mixed_get_lpctype (ldmud_lpctype_t* type)
+
+/* Return the lpctype for ldmud.Mixed.
+ */
+
+{
+    return lpctype_mixed;
+} /* ldmud_mixed_get_lpctype() */
+
+/*-------------------------------------------------------------------------*/
+
+static ldmud_lpctype_t ldmud_mixed_type =
+{{
+    PyVarObject_HEAD_INIT(&ldmud_lpctype_type.type_base, 0)
+    "ldmud.Mixed",                      /* tp_name */
+    sizeof(PyObject),                   /* tp_basicsize */
+    0,                                  /* tp_itemsize */
+    0,                                  /* tp_dealloc */
+    0,                                  /* tp_print */
+    0,                                  /* tp_getattr */
+    0,                                  /* tp_setattr */
+    0,                                  /* tp_reserved */
+    0,                                  /* tp_repr */
+    0,                                  /* tp_as_number */
+    0,                                  /* tp_as_sequence */
+    0,                                  /* tp_as_mapping */
+    0,                                  /* tp_hash  */
+    0,                                  /* tp_call */
+    0,                                  /* tp_str */
+    0,                                  /* tp_getattro */
+    0,                                  /* tp_setattro */
+    0,                                  /* tp_as_buffer */
+    Py_TPFLAGS_DEFAULT|Py_TPFLAGS_TYPE_SUBCLASS, /* tp_flags */
+    "LPC any value",                    /* tp_doc */
+    0,                                  /* tp_traverse */
+    0,                                  /* tp_clear */
+    0,                                  /* tp_richcompare */
+    0,                                  /* tp_weaklistoffset */
+    0,                                  /* tp_iter */
+    0,                                  /* tp_iternext */
+    0,                                  /* tp_methods */
+    0,                                  /* tp_members */
+    0,                                  /* tp_getset */
+    0,                                  /* tp_base */
+    0,                                  /* tp_dict */
+    0,                                  /* tp_descr_get */
+    0,                                  /* tp_descr_set */
+    0,                                  /* tp_dictoffset */
+    0,                                  /* tp_init */
+    0,                                  /* tp_alloc */
+    ldmud_mixed_new,                    /* tp_new */
+},  ldmud_mixed_get_lpctype             /* get_lpctype */
+};
+
+/*-------------------------------------------------------------------------*/
+/* Void */
+
+/*-------------------------------------------------------------------------*/
+static lpctype_t*
+ldmud_void_get_lpctype (ldmud_lpctype_t* type)
+
+/* Return the lpctype for ldmud.Void.
+ */
+
+{
+    return lpctype_void;
+} /* ldmud_void_get_lpctype() */
+
+/*-------------------------------------------------------------------------*/
+
+static ldmud_lpctype_t ldmud_void_type =
+{{
+    PyVarObject_HEAD_INIT(&ldmud_lpctype_type.type_base, 0)
+    "ldmud.Void",                      /* tp_name */
+    sizeof(PyObject),                   /* tp_basicsize */
+    0,                                  /* tp_itemsize */
+    0,                                  /* tp_dealloc */
+    0,                                  /* tp_print */
+    0,                                  /* tp_getattr */
+    0,                                  /* tp_setattr */
+    0,                                  /* tp_reserved */
+    0,                                  /* tp_repr */
+    0,                                  /* tp_as_number */
+    0,                                  /* tp_as_sequence */
+    0,                                  /* tp_as_mapping */
+    0,                                  /* tp_hash  */
+    0,                                  /* tp_call */
+    0,                                  /* tp_str */
+    0,                                  /* tp_getattro */
+    0,                                  /* tp_setattro */
+    0,                                  /* tp_as_buffer */
+    Py_TPFLAGS_DEFAULT|Py_TPFLAGS_TYPE_SUBCLASS, /* tp_flags */
+    "LPC void",                         /* tp_doc */
+    0,                                  /* tp_traverse */
+    0,                                  /* tp_clear */
+    0,                                  /* tp_richcompare */
+    0,                                  /* tp_weaklistoffset */
+    0,                                  /* tp_iter */
+    0,                                  /* tp_iternext */
+    0,                                  /* tp_methods */
+    0,                                  /* tp_members */
+    0,                                  /* tp_getset */
+    0,                                  /* tp_base */
+    0,                                  /* tp_dict */
+    0,                                  /* tp_descr_get */
+    0,                                  /* tp_descr_set */
+    0,                                  /* tp_dictoffset */
+    0,                                  /* tp_init */
+    0,                                  /* tp_alloc */
+    0,                                  /* tp_new */
+},  ldmud_void_get_lpctype             /* get_lpctype */
+};
+
+/*-------------------------------------------------------------------------*/
 /* Interrupt exception */
 
 static PyTypeObject ldmud_interrupt_exception_type =
@@ -9058,6 +11826,9 @@ ldmud_traverse (PyObject *self, visitproc visit, void *arg)
 {
     for (int i = 0; i < PYTHON_EFUN_TABLE_SIZE; i++)
         Py_VISIT(python_efun_table[i].callable);
+    for (int i = 0; i < PYTHON_TYPE_TABLE_SIZE; i++)
+        if (python_type_table[i] != NULL)
+            Py_VISIT(python_type_table[i]->pytype);
     for (python_poll_fds_t *cur = poll_fds; cur != NULL; cur = cur->next)
     {
         Py_VISIT(cur->eventsfun);
@@ -9083,6 +11854,9 @@ ldmud_clear (PyObject *self)
 {
     for (int i = 0; i < PYTHON_EFUN_TABLE_SIZE; i++)
         Py_CLEAR(python_efun_table[i].callable);
+    for (int i = 0; i < PYTHON_TYPE_TABLE_SIZE; i++)
+        if (python_type_table[i] != NULL)
+            Py_CLEAR(python_type_table[i]->pytype);
     for (python_poll_fds_t *cur = poll_fds; cur != NULL; cur = cur->next)
     {
         Py_CLEAR(cur->eventsfun);
@@ -9132,7 +11906,8 @@ static PyMethodDef ldmud_methods[] =
         (PyCFunction) python_register_efun, METH_VARARGS | METH_KEYWORDS,
         "register_efun(name, function) -> None\n\n"
         "Registers a new efun name. This is not allowed during\n"
-        "compilation of an LPC object."
+        "compilation of an LPC object and must not be a permanent\n"
+        "define or reserved word."
     },
 
     {
@@ -9140,6 +11915,22 @@ static PyMethodDef ldmud_methods[] =
         (PyCFunction) python_unregister_efun, METH_VARARGS | METH_KEYWORDS,
         "unregister_efun(name) -> None\n\n"
         "Removes a python efun from registration. This is not allowed\n"
+        "during compilation of an LPC object."
+    },
+
+    {
+        "register_type",
+        (PyCFunction) python_register_type, METH_VARARGS | METH_KEYWORDS,
+        "register_type(name, type) -> None\n\n"
+        "Registers a new type. This is not allowed during\n"
+        "compilation of an LPC object and must not be a permanent define."
+    },
+
+    {
+        "unregister_type",
+        (PyCFunction) python_unregister_type, METH_VARARGS | METH_KEYWORDS,
+        "unregister_type(name) -> None\n\n"
+        "Removes a python type from registration. This is not allowed\n"
         "during compilation of an LPC object."
     },
 
@@ -9215,6 +12006,52 @@ static PyModuleDef ldmud_module =
     NULL                                /* m_free */
 };
 
+static bool
+register_lpctype (PyObject *module, const char* name, ldmud_lpctype_t* type)
+
+/* Register <type> in <module> as <name>.
+ * Update <type> so that it inherits ldmud_lpctype_type.
+ * Returns true on success.
+ */
+
+{
+    assert(PyObject_TypeCheck(&type->type_base, &ldmud_lpctype_type.type_base));
+
+    if (!type->type_base.tp_mro)
+    {
+        PyObject *mro = PyTuple_New(type == &ldmud_lpctype_type ? 3 : 2);
+        int pos = 0;
+        if (!mro)
+            return false;
+
+        PyTuple_SET_ITEM(mro, pos++, (PyObject*) type);
+        Py_INCREF(type);
+        if (type == &ldmud_lpctype_type)
+        {
+            PyTuple_SET_ITEM(mro, pos++, (PyObject*) &PyType_Type);
+            Py_INCREF(&PyType_Type);
+        }
+        PyTuple_SET_ITEM(mro, pos++, (PyObject*) &PyBaseObject_Type);
+        Py_INCREF(&PyBaseObject_Type);
+
+        type->type_base.tp_mro = mro;
+    }
+
+    if (!type->type_base.tp_basicsize && type->type_base.tp_base)
+    {
+        type->type_base.tp_basicsize = type->type_base.tp_base->tp_basicsize;
+        type->type_base.tp_itemsize = type->type_base.tp_base->tp_itemsize;
+    }
+
+    if (PyType_Ready(&type->type_base) < 0)
+        return false;
+
+    Py_INCREF(type);
+    PyModule_AddObject(module, name, (PyObject*) type);
+
+    return true;
+} /* register_lpctype() */
+
 static PyObject*
 init_ldmud_module ()
 
@@ -9224,10 +12061,85 @@ init_ldmud_module ()
 {
     PyObject *module, *efuns;
 
-    /* Initialize types. */
-    if (PyType_Ready(&ldmud_object_type) < 0)
+    /* Initialize module. */
+    module = PyModule_Create(&ldmud_module);
+    if (module == NULL)
+        return module;
+
+    /* Add types to module. */
+    Py_INCREF(&PyType_Type);
+    if (PyType_Type.tp_basicsize > ldmud_lpctype_type.type_base.tp_basicsize)
+        ldmud_lpctype_type.type_base.tp_basicsize = PyType_Type.tp_basicsize;
+    if (PyType_Type.tp_basicsize > ldmud_union_type_type.tp_basicsize)
+        ldmud_union_type_type.tp_basicsize = PyType_Type.tp_basicsize;
+    if (PyType_Type.tp_basicsize > ldmud_concrete_array_type_type.tp_basicsize)
+        ldmud_concrete_array_type_type.tp_basicsize = PyType_Type.tp_basicsize;
+    if (PyType_Type.tp_basicsize > ldmud_any_array_type_type.tp_basicsize)
+        ldmud_any_array_type_type.tp_basicsize = PyType_Type.tp_basicsize;
+    if (PyType_Type.tp_basicsize > ldmud_concrete_struct_type_type.tp_basicsize)
+        ldmud_concrete_struct_type_type.tp_basicsize = PyType_Type.tp_basicsize;
+    if (PyType_Type.tp_basicsize > ldmud_any_struct_type_type.tp_basicsize)
+        ldmud_any_struct_type_type.tp_basicsize = PyType_Type.tp_basicsize;
+    if (PyType_Type.tp_basicsize > ldmud_concrete_object_type_type.tp_basicsize)
+        ldmud_concrete_object_type_type.tp_basicsize = PyType_Type.tp_basicsize;
+    if (PyType_Type.tp_basicsize > ldmud_any_object_type_type.tp_basicsize)
+        ldmud_any_object_type_type.tp_basicsize = PyType_Type.tp_basicsize;
+    if (PyType_Type.tp_basicsize > ldmud_concrete_lwobject_type_type.tp_basicsize)
+        ldmud_concrete_lwobject_type_type.tp_basicsize = PyType_Type.tp_basicsize;
+    if (PyType_Type.tp_basicsize > ldmud_any_lwobject_type_type.tp_basicsize)
+        ldmud_any_lwobject_type_type.tp_basicsize = PyType_Type.tp_basicsize;
+
+#ifdef Py_TPFLAGS_DISALLOW_INSTANTIATION
+    ldmud_void_type.type_base.tp_flags |= Py_TPFLAGS_DISALLOW_INSTANTIATION;
+#endif
+
+    if (!register_lpctype(module, "LPCType",     &ldmud_lpctype_type)
+     || !register_lpctype(module, "Integer",     &ldmud_integer_type)
+     || !register_lpctype(module, "Float",       &ldmud_float_type)
+     || !register_lpctype(module, "String",      &ldmud_string_type)
+     || !register_lpctype(module, "Bytes",       &ldmud_bytes_type)
+     || !register_lpctype(module, "Object",      &ldmud_object_type)
+     || !register_lpctype(module, "LWObject",    &ldmud_lwobject_type)
+     || !register_lpctype(module, "Array",       &ldmud_array_type)
+     || !register_lpctype(module, "Mapping",     &ldmud_mapping_type)
+     || !register_lpctype(module, "Struct",      &ldmud_struct_type)
+     || !register_lpctype(module, "Closure",     &ldmud_closure_type)
+     || !register_lpctype(module, "Coroutine",   &ldmud_coroutine_type)
+     || !register_lpctype(module, "Symbol",      &ldmud_symbol_type)
+     || !register_lpctype(module, "QuotedArray", &ldmud_quoted_array_type)
+     || !register_lpctype(module, "Mixed",       &ldmud_mixed_type)
+     || !register_lpctype(module, "Void",        &ldmud_void_type))
         return NULL;
-    if (PyType_Ready(&ldmud_lwobject_type) < 0)
+
+#ifndef Py_TPFLAGS_DISALLOW_INSTANTIATION
+    if (ldmud_void_type.type_base.tp_dict != NULL)
+    {
+        /* Remove the __new__ function. */
+        if (PyDict_DelItemString(ldmud_void_type.type_base.tp_dict, "__new__"))
+            PyErr_Clear();
+    }
+#endif
+
+    /* Initialize (non-lpctype) types. */
+    if (PyType_Ready(&ldmud_union_type_type) < 0)
+        return NULL;
+    if (PyType_Ready(&ldmud_union_type_iter_type) < 0)
+        return NULL;
+    if (PyType_Ready(&ldmud_concrete_array_type_type) < 0)
+        return NULL;
+    if (PyType_Ready(&ldmud_any_array_type_type) < 0)
+        return NULL;
+    if (PyType_Ready(&ldmud_concrete_struct_type_type) < 0)
+        return NULL;
+    if (PyType_Ready(&ldmud_any_struct_type_type) < 0)
+        return NULL;
+    if (PyType_Ready(&ldmud_concrete_object_type_type) < 0)
+        return NULL;
+    if (PyType_Ready(&ldmud_any_object_type_type) < 0)
+        return NULL;
+    if (PyType_Ready(&ldmud_concrete_lwobject_type_type) < 0)
+        return NULL;
+    if (PyType_Ready(&ldmud_any_lwobject_type_type) < 0)
         return NULL;
     if (PyType_Ready(&ldmud_program_functions_type) < 0)
         return NULL;
@@ -9239,29 +12151,15 @@ init_ldmud_module ()
         return NULL;
     if (PyType_Ready(&ldmud_program_variable_type) < 0)
         return NULL;
-    if (PyType_Ready(&ldmud_array_type) < 0)
-        return NULL;
-    if (PyType_Ready(&ldmud_mapping_type) < 0)
-        return NULL;
     if (PyType_Ready(&ldmud_mapping_list_type) < 0)
         return NULL;
     if (PyType_Ready(&ldmud_mapping_iter_type) < 0)
-        return NULL;
-    if (PyType_Ready(&ldmud_struct_type) < 0)
         return NULL;
     if (PyType_Ready(&ldmud_struct_members_type) < 0)
         return NULL;
     if (PyType_Ready(&ldmud_struct_member_type) < 0)
         return NULL;
-    if (PyType_Ready(&ldmud_closure_type) < 0)
-        return NULL;
-    if (PyType_Ready(&ldmud_coroutine_type) < 0)
-        return NULL;
     if (PyType_Ready(&ldmud_coroutine_variables_type) < 0)
-        return NULL;
-    if (PyType_Ready(&ldmud_symbol_type) < 0)
-        return NULL;
-    if (PyType_Ready(&ldmud_quoted_array_type) < 0)
         return NULL;
     if (PyType_Ready(&ldmud_lvalue_type) < 0)
         return NULL;
@@ -9272,34 +12170,12 @@ init_ldmud_module ()
     if (PyType_Ready(&ldmud_interrupt_exception_type) < 0)
         return NULL;
 
-    /* Initialize module. */
-    module = PyModule_Create(&ldmud_module);
-    if (module == NULL)
-        return module;
-
-    /* Add types to module. */
-    Py_INCREF(&ldmud_object_type);
-    Py_INCREF(&ldmud_lwobject_type);
-    Py_INCREF(&ldmud_array_type);
-    Py_INCREF(&ldmud_mapping_type);
-    Py_INCREF(&ldmud_struct_type);
-    Py_INCREF(&ldmud_closure_type);
-    Py_INCREF(&ldmud_coroutine_type);
-    Py_INCREF(&ldmud_symbol_type);
-    Py_INCREF(&ldmud_quoted_array_type);
-    Py_INCREF(&ldmud_interrupt_exception_type);
-    PyModule_AddObject(module, "Object", (PyObject*) &ldmud_object_type);
-    PyModule_AddObject(module, "LWObject", (PyObject*) &ldmud_lwobject_type);
-    PyModule_AddObject(module, "Array", (PyObject*) &ldmud_array_type);
-    PyModule_AddObject(module, "Mapping", (PyObject*) &ldmud_mapping_type);
-    PyModule_AddObject(module, "Struct", (PyObject*) &ldmud_struct_type);
-    PyModule_AddObject(module, "Closure", (PyObject*) &ldmud_closure_type);
-    PyModule_AddObject(module, "Coroutine", (PyObject*) &ldmud_coroutine_type);
-    PyModule_AddObject(module, "Symbol", (PyObject*) &ldmud_symbol_type);
-    PyModule_AddObject(module, "QuotedArray", (PyObject*) &ldmud_quoted_array_type);
+    Py_INCREF(&ldmud_lvalue_type);
     PyModule_AddObject(module, "Lvalue", (PyObject*) &ldmud_lvalue_type);
+    Py_INCREF(&ldmud_interrupt_exception_type);
     PyModule_AddObject(module, "InterruptException", (PyObject*) &ldmud_interrupt_exception_type);
 
+    /* Add constants to module. */
     assert(PYTHON_HOOK_COUNT == sizeof(python_hook_names) / sizeof(python_hook_names[0]));
     for (int i = 0; i < PYTHON_HOOK_COUNT; i++)
         PyModule_AddIntConstant(module, python_hook_names[i], i);
@@ -9339,7 +12215,7 @@ static PyObject*
 lpctype_to_pythontype (lpctype_t *type)
 
 /* Creates a Python type from an lpctype_t.
- * mixed/unknown will be returned as NULL.
+ * Unsupported types will be returned as NULL.
  */
 
 {
@@ -9352,24 +12228,24 @@ lpctype_to_pythontype (lpctype_t *type)
             switch (type->t_primary)
             {
                 case TYPE_NUMBER:
-                    Py_INCREF(&PyLong_Type);
-                    return (PyObject *)&PyLong_Type;
+                    Py_INCREF(&ldmud_integer_type);
+                    return (PyObject *)&ldmud_integer_type;
 
                 case TYPE_STRING:
-                    Py_INCREF(&PyUnicode_Type);
-                    return (PyObject *)&PyUnicode_Type;
+                    Py_INCREF(&ldmud_string_type);
+                    return (PyObject *)&ldmud_string_type;
 
                 case TYPE_VOID:
-                    Py_INCREF(Py_None);
-                    return Py_None;
+                    Py_INCREF(&ldmud_void_type);
+                    return (PyObject *)&ldmud_void_type;
 
                 case TYPE_MAPPING:
                     Py_INCREF(&ldmud_mapping_type);
                     return (PyObject *)&ldmud_mapping_type;
 
                 case TYPE_FLOAT:
-                    Py_INCREF(&PyFloat_Type);
-                    return (PyObject *)&PyFloat_Type;
+                    Py_INCREF(&ldmud_float_type);
+                    return (PyObject *)&ldmud_float_type;
 
                 case TYPE_CLOSURE:
                     Py_INCREF(&ldmud_closure_type);
@@ -9388,82 +12264,88 @@ lpctype_to_pythontype (lpctype_t *type)
                     return (PyObject *)&ldmud_quoted_array_type;
 
                 case TYPE_BYTES:
-                    Py_INCREF(&PyBytes_Type);
-                    return (PyObject *)&PyBytes_Type;
+                    Py_INCREF(&ldmud_bytes_type);
+                    return (PyObject *)&ldmud_bytes_type;
+
+                case TYPE_LPCTYPE:
+                    Py_INCREF(&ldmud_lpctype_type);
+                    return (PyObject *)&ldmud_lpctype_type;
 
                 case TYPE_UNKNOWN:
                 case TYPE_ANY:
-                    break;
+                    Py_INCREF(&ldmud_mixed_type);
+                    return (PyObject *)&ldmud_mixed_type;
             }
             break;
 
         case TCLASS_STRUCT:
-            Py_INCREF(&ldmud_struct_type);
-            return (PyObject *)&ldmud_struct_type;
+        {
+            struct_name_t *name = type->t_struct.name;
+            if (name)
+                return ldmud_concrete_struct_type_create(ref_struct_name(name));
+            else
+            {
+                Py_INCREF(&ldmud_struct_type);
+                return (PyObject *)&ldmud_struct_type;
+            }
+        }
 
         case TCLASS_OBJECT:
             switch (type->t_object.type)
             {
                 case OBJECT_REGULAR:
-                    Py_INCREF(&ldmud_object_type);
-                    return (PyObject *)&ldmud_object_type;
+                    if (type->t_object.program_name == NULL)
+                    {
+                        Py_INCREF(&ldmud_object_type);
+                        return (PyObject *)&ldmud_object_type;
+                    }
+                    else
+                        return ldmud_concrete_object_type_create(ref_lpctype(type));
 
                 case OBJECT_LIGHTWEIGHT:
-                    Py_INCREF(&ldmud_lwobject_type);
-                    return (PyObject *)&ldmud_lwobject_type;
+                    if (type->t_object.program_name == NULL)
+                    {
+                        Py_INCREF(&ldmud_lwobject_type);
+                        return (PyObject *)&ldmud_lwobject_type;
+                    }
+                    else
+                        return ldmud_concrete_lwobject_type_create(ref_lpctype(type));
             }
             break;
 
+        case TCLASS_PYTHON:
+        {
+            PyObject *pytype = python_type_table[type->t_python.type_id]->pytype;
+            if (pytype)
+            {
+                Py_INCREF(pytype);
+                return pytype;
+            }
+            break;
+        }
+
         case TCLASS_ARRAY:
-            Py_INCREF(&ldmud_array_type);
-            return (PyObject *)&ldmud_array_type;
+        {
+            lpctype_t *elem = type->t_array.element;
+            if (elem == lpctype_mixed)
+            {
+                Py_INCREF(&ldmud_array_type);
+                return (PyObject *)&ldmud_array_type;
+            }
+            else
+            {
+                PyObject *pelem = lpctype_to_pythontype(elem);
+                PyObject *result = NULL;
+                if (pelem != NULL && PyObject_TypeCheck(pelem, &ldmud_lpctype_type.type_base))
+                    result = ldmud_concrete_array_type_create((ldmud_lpctype_t*)pelem);
+
+                Py_XDECREF(pelem);
+                return result;
+            }
+        }
 
         case TCLASS_UNION:
-        {
-            PyObject *result, *part;
-            lpctype_t *cur = type;
-            int i = 0, num = 1;
-
-            while (cur->t_class == TCLASS_UNION)
-            {
-                num++;
-                cur = cur->t_union.head;
-            }
-
-            result = PyTuple_New(num);
-            if (!result)
-            {
-                PyErr_Clear();
-                return NULL;
-            }
-
-            cur = type;
-            while (cur->t_class == TCLASS_UNION)
-            {
-                part = lpctype_to_pythontype(cur->t_union.member);
-                if (!part)
-                {
-                    Py_DECREF(result);
-                    return NULL;
-                }
-
-                PyTuple_SET_ITEM(result, i, part);
-
-                i++;
-                cur = cur->t_union.head;
-            }
-
-            part = lpctype_to_pythontype(cur);
-            if (!part)
-            {
-                Py_DECREF(result);
-                return NULL;
-            }
-
-            PyTuple_SET_ITEM(result, i, part);
-
-            return result;
-        }
+            return ldmud_union_type_create(ref_lpctype(type));
     }
 
     return NULL;
@@ -9484,37 +12366,17 @@ pythontype_to_lpctype (PyObject* ptype)
 {
     if (ptype == Py_None)
         return lpctype_void;
+    else if (PyObject_TypeCheck(ptype, &ldmud_lpctype_type.type_base))
+        return ((ldmud_lpctype_t*)ptype)->get_lpctype((ldmud_lpctype_t*)ptype);
     else if (PyType_Check(ptype))
     {
-        /* Most of them are static type objects, so we don't
-         * need to ref-count them.
-         */
-        if (PyObject_IsSubclass(ptype, (PyObject*) &ldmud_object_type))
-            return lpctype_any_object;
-
-        if (PyObject_IsSubclass(ptype, (PyObject*) &ldmud_lwobject_type))
-            return lpctype_any_lwobject;
-
-        if (PyObject_IsSubclass(ptype, (PyObject*) &ldmud_array_type))
-            return get_array_type(lpctype_mixed);
-
-        if (PyObject_IsSubclass(ptype, (PyObject*) &ldmud_mapping_type))
-            return lpctype_mapping;
-
-        if (PyObject_IsSubclass(ptype, (PyObject*) &ldmud_struct_type))
-            return lpctype_any_struct;
-
-        if (PyObject_IsSubclass(ptype, (PyObject*) &ldmud_closure_type))
-            return lpctype_closure;
-
-        if (PyObject_IsSubclass(ptype, (PyObject*) &ldmud_coroutine_type))
-            return lpctype_coroutine;
-
-        if (PyObject_IsSubclass(ptype, (PyObject*) &ldmud_symbol_type))
-            return lpctype_symbol;
-
-        if (PyObject_IsSubclass(ptype, (PyObject*) &ldmud_quoted_array_type))
-            return lpctype_quoted_array;
+        for (int i = 0; i < PYTHON_TYPE_TABLE_SIZE; i++)
+            if (python_type_table[i] != NULL)
+            {
+                PyObject * regtype = python_type_table[i]->pytype;
+                if (regtype && PyObject_IsSubclass(ptype, regtype))
+                    return get_python_type(i);
+            }
 
         if (PyObject_IsSubclass(ptype, (PyObject*) &PyLong_Type))
             return lpctype_int;
@@ -9567,6 +12429,77 @@ pythontype_to_lpctype (PyObject* ptype)
 /*-------------------------------------------------------------------------*/
 
 static PyObject*
+adapt_pythontype (PyObject *ptype)
+
+/* Return the LPCType representation of <ptype>. If <ptype> already is
+ * an ldmud_lpctype_type return a new referece to it, otherwise create
+ * the corresponding ldmud_lpctype_type and return it. Returns NULL
+ * and sets an exception upon an error.
+ */
+
+{
+    if (ptype == Py_None
+     || PyObject_TypeCheck(ptype, &ldmud_lpctype_type.type_base))
+    {
+        Py_INCREF(ptype);
+        return ptype;
+    }
+    else if (PyType_Check(ptype))
+    {
+        for (int i = 0; i < PYTHON_TYPE_TABLE_SIZE; i++)
+            if (python_type_table[i] != NULL
+             && python_type_table[i]->pytype != NULL
+             && PyObject_IsSubclass(ptype, python_type_table[i]->pytype))
+            {
+                Py_INCREF(ptype);
+                return ptype;
+            }
+
+        if (PyObject_IsSubclass(ptype, (PyObject*) &PyLong_Type)
+         || PyObject_IsSubclass(ptype, (PyObject*) &PyBool_Type))
+        {
+            Py_INCREF(&ldmud_integer_type);
+            return (PyObject *)&ldmud_integer_type;
+        }
+
+        if (PyObject_IsSubclass(ptype, (PyObject*) &PyFloat_Type))
+        {
+            Py_INCREF(&ldmud_float_type);
+            return (PyObject *)&ldmud_float_type;
+        }
+
+        if (PyObject_IsSubclass(ptype, (PyObject*) &PyBytes_Type))
+        {
+            Py_INCREF(&ldmud_bytes_type);
+            return (PyObject *)&ldmud_bytes_type;
+        }
+
+        if (PyObject_IsSubclass(ptype, (PyObject*) &PyUnicode_Type))
+        {
+            Py_INCREF(&ldmud_string_type);
+            return (PyObject *)&ldmud_string_type;
+        }
+    }
+    else  if (PyTuple_Check(ptype))
+    {
+        lpctype_t *t = pythontype_to_lpctype(ptype);
+        if (t)
+        {
+            PyObject *result = lpctype_to_pythontype(t);
+            free_lpctype(t);
+            if (result)
+                return result;
+        }
+    }
+
+    PyErr_Format(PyExc_TypeError, "unsupported type '%R'", ptype);
+    return NULL;
+} /* adapt_pythontype() */
+
+
+/*-------------------------------------------------------------------------*/
+
+static PyObject*
 svalue_to_python (svalue_t *svp)
 
 /* Creates a python value from an svalue_t.
@@ -9613,7 +12546,7 @@ svalue_to_python (svalue_t *svp)
 
         case T_STRUCT:
         {
-            PyObject* val = ldmud_struct_new(&ldmud_struct_type, NULL, NULL);
+            PyObject* val = ldmud_struct_new(&ldmud_struct_type.type_base, NULL, NULL);
             if (val != NULL)
                 ((ldmud_struct_t*)val)->lpc_struct = ref_struct(svp->u.strct);
 
@@ -9622,6 +12555,21 @@ svalue_to_python (svalue_t *svp)
 
         case T_LVALUE:
             return ldmud_lvalue_create(svp);
+
+        case T_PYTHON:
+        {
+            PyObject *val = (PyObject*)svp->u.generic;
+            Py_INCREF(val);
+            return val;
+        }
+
+        case T_LPCTYPE:
+        {
+            PyObject *val = lpctype_to_pythontype(svp->u.lpctype);
+            if (!val)
+                PyErr_Format(PyExc_TypeError, "unsupported lpctype [%s]", get_lpctype_name(svp->u.lpctype));
+            return val;
+        }
 
         default:
             PyErr_Format(PyExc_TypeError, "unsupported type %d", svp->type);
@@ -9652,6 +12600,42 @@ rvalue_to_python (svalue_t *svp)
 
 /*-------------------------------------------------------------------------*/
 
+static string_t*
+python_string_to_string (PyObject* pstr)
+
+/* Convert a Python string to an LPC string.
+ * If it's not a Python string or not decodable to UTF-8 return NULL.
+ */
+
+{
+    PyObject *utf8;
+    Py_ssize_t length;
+    char * buf;
+    string_t * str;
+
+    if (!PyUnicode_Check(pstr))
+        return NULL;
+
+    utf8 = PyUnicode_AsEncodedString(pstr, "utf-8", "replace");
+    if (utf8 == NULL)
+    {
+        PyErr_Clear();
+        return NULL;
+    }
+
+    if (PyBytes_AsStringAndSize(utf8, &buf, &length) < 0)
+    {
+        PyErr_Clear();
+        return NULL;
+    }
+
+    str = new_n_unicode_mstring(buf, length);
+    Py_DECREF(utf8);
+
+    return str;
+} /* python_string_to_string() */
+
+/*-------------------------------------------------------------------------*/
 
 static const char*
 python_to_svalue (svalue_t *dest, PyObject* val)
@@ -9671,7 +12655,17 @@ python_to_svalue (svalue_t *dest, PyObject* val)
     }
 
     /* First we check our own types. */
-    if (PyObject_TypeCheck(val, &ldmud_object_type))
+    if (PyType_Check(val))
+    {
+        lpctype_t *t = pythontype_to_lpctype(val);
+        if (!t)
+            return "unknown type";
+
+        put_lpctype(dest, t);
+        return NULL;
+    }
+
+    if (PyObject_TypeCheck(val, &ldmud_object_type.type_base))
     {
         object_t *ob = ((ldmud_object_t*)val)->lpc_object;
         if (ob != NULL && !(ob->flags & O_DESTRUCTED))
@@ -9681,7 +12675,7 @@ python_to_svalue (svalue_t *dest, PyObject* val)
         return NULL;
     }
 
-    if (PyObject_TypeCheck(val, &ldmud_lwobject_type))
+    if (PyObject_TypeCheck(val, &ldmud_lwobject_type.type_base))
     {
         lwobject_t *lwob = ((ldmud_lwobject_t*)val)->lpc_lwobject;
         if (lwob != NULL)
@@ -9691,7 +12685,7 @@ python_to_svalue (svalue_t *dest, PyObject* val)
         return NULL;
     }
 
-    if (PyObject_TypeCheck(val, &ldmud_array_type))
+    if (PyObject_TypeCheck(val, &ldmud_array_type.type_base))
     {
         vector_t* arr = ((ldmud_array_t*)val)->lpc_array;
         if (arr != NULL)
@@ -9701,7 +12695,7 @@ python_to_svalue (svalue_t *dest, PyObject* val)
         return NULL;
     }
 
-    if (PyObject_TypeCheck(val, &ldmud_mapping_type))
+    if (PyObject_TypeCheck(val, &ldmud_mapping_type.type_base))
     {
         mapping_t* m = ((ldmud_mapping_t*)val)->lpc_mapping;
         if (m != NULL)
@@ -9711,7 +12705,7 @@ python_to_svalue (svalue_t *dest, PyObject* val)
         return NULL;
     }
 
-    if (PyObject_TypeCheck(val, &ldmud_struct_type))
+    if (PyObject_TypeCheck(val, &ldmud_struct_type.type_base))
     {
         struct_t* s = ((ldmud_struct_t*)val)->lpc_struct;
         if (s != NULL)
@@ -9721,7 +12715,7 @@ python_to_svalue (svalue_t *dest, PyObject* val)
         return NULL;
     }
 
-    if (PyObject_TypeCheck(val, &ldmud_closure_type))
+    if (PyObject_TypeCheck(val, &ldmud_closure_type.type_base))
     {
         assign_svalue_no_free(dest, &((ldmud_closure_t*)val)->lpc_closure);
         if (dest->type == T_INVALID)
@@ -9729,7 +12723,7 @@ python_to_svalue (svalue_t *dest, PyObject* val)
         return NULL;
     }
 
-    if (PyObject_TypeCheck(val, &ldmud_coroutine_type))
+    if (PyObject_TypeCheck(val, &ldmud_coroutine_type.type_base))
     {
         coroutine_t *cr = ((ldmud_coroutine_t*)val)->lpc_coroutine;
         if(cr != NULL)
@@ -9739,7 +12733,7 @@ python_to_svalue (svalue_t *dest, PyObject* val)
         return NULL;
     }
 
-    if (PyObject_TypeCheck(val, &ldmud_symbol_type))
+    if (PyObject_TypeCheck(val, &ldmud_symbol_type.type_base))
     {
         assign_svalue_no_free(dest, &((ldmud_symbol_t*)val)->lpc_symbol);
         if (dest->type == T_INVALID)
@@ -9747,7 +12741,7 @@ python_to_svalue (svalue_t *dest, PyObject* val)
         return NULL;
     }
 
-    if (PyObject_TypeCheck(val, &ldmud_quoted_array_type))
+    if (PyObject_TypeCheck(val, &ldmud_quoted_array_type.type_base))
     {
         assign_svalue_no_free(dest, &((ldmud_quoted_array_t*)val)->lpc_quoted_array);
         if (dest->type == T_INVALID)
@@ -9761,6 +12755,23 @@ python_to_svalue (svalue_t *dest, PyObject* val)
         if (dest->type == T_INVALID)
             put_number(dest, 0);
         return NULL;
+    }
+
+    /* Next come the registered types. */
+    for (int idx = 0; idx < PYTHON_TYPE_TABLE_SIZE; idx++)
+    {
+        if (python_type_table[idx] != NULL
+         && python_type_table[idx]->pytype != NULL
+         && PyObject_TypeCheck(val, (PyTypeObject*) python_type_table[idx]->pytype))
+        {
+            dest->type = T_PYTHON;
+            dest->x.python_type = idx;
+            dest->u.generic = val;
+
+            Py_INCREF(val);
+            num_lpc_python_references++;
+            return NULL;
+        }
     }
 
     /* And now the python ones. */
@@ -9805,21 +12816,10 @@ python_to_svalue (svalue_t *dest, PyObject* val)
 
     if (PyUnicode_Check(val))
     {
-        PyObject *utf8;
-        Py_ssize_t length;
-        char * buf;
-        string_t * str;
-
-        utf8 = PyUnicode_AsEncodedString(val, "utf-8", "replace");
-        if (utf8 == NULL)
+        string_t * str = python_string_to_string(val);
+        if (str == NULL)
             return "undecodable unicode string";
 
-        PyBytes_AsStringAndSize(utf8, &buf, &length);
-        str = new_n_unicode_mstring(buf, length);
-        Py_DECREF(utf8);
-
-        if (str == NULL)
-            return "out of memory";
         put_string(dest, str);
         return NULL;
     }
@@ -9841,8 +12841,29 @@ python_eq_svalue (PyObject* pval, svalue_t *sval)
     if (pval == Py_None)
         return false;
 
-    /* First we check our own types. */
-    if (PyObject_TypeCheck(pval, &ldmud_object_type))
+    /* Simple case, a registered Python object. */
+    if (sval->type == T_PYTHON)
+        return pval == sval->u.generic;
+
+    /* Then we check our own types. */
+    if (PyType_Check(pval))
+    {
+        if (sval->type == T_LPCTYPE)
+        {
+            lpctype_t *t = pythontype_to_lpctype(pval);
+            bool result;
+            if (!t)
+                return false;
+
+            result = sval->u.lpctype == t;
+            free_lpctype(t);
+            return result;
+        }
+        else
+            return false;
+    }
+
+    if (PyObject_TypeCheck(pval, &ldmud_lpctype_type.type_base))
     {
         if (sval->type == T_OBJECT)
             return sval->u.ob == ((ldmud_object_t*)pval)->lpc_object;
@@ -9850,7 +12871,7 @@ python_eq_svalue (PyObject* pval, svalue_t *sval)
             return false;
     }
 
-    if (PyObject_TypeCheck(pval, &ldmud_lwobject_type))
+    if (PyObject_TypeCheck(pval, &ldmud_lwobject_type.type_base))
     {
         if (sval->type == T_LWOBJECT)
             return sval->u.lwob == ((ldmud_lwobject_t*)pval)->lpc_lwobject;
@@ -9858,7 +12879,7 @@ python_eq_svalue (PyObject* pval, svalue_t *sval)
             return false;
     }
 
-    if (PyObject_TypeCheck(pval, &ldmud_array_type))
+    if (PyObject_TypeCheck(pval, &ldmud_array_type.type_base))
     {
         if (sval->type == T_POINTER)
             return sval->u.vec == ((ldmud_array_t*)pval)->lpc_array;
@@ -9866,7 +12887,7 @@ python_eq_svalue (PyObject* pval, svalue_t *sval)
             return false;
     }
 
-    if (PyObject_TypeCheck(pval, &ldmud_mapping_type))
+    if (PyObject_TypeCheck(pval, &ldmud_mapping_type.type_base))
     {
         if (sval->type == T_MAPPING)
             return sval->u.map == ((ldmud_mapping_t*)pval)->lpc_mapping;
@@ -9874,7 +12895,7 @@ python_eq_svalue (PyObject* pval, svalue_t *sval)
             return false;
     }
 
-    if (PyObject_TypeCheck(pval, &ldmud_struct_type))
+    if (PyObject_TypeCheck(pval, &ldmud_struct_type.type_base))
     {
         if (sval->type == T_STRUCT)
             return sval->u.strct == ((ldmud_struct_t*)pval)->lpc_struct;
@@ -9882,7 +12903,7 @@ python_eq_svalue (PyObject* pval, svalue_t *sval)
             return false;
     }
 
-    if (PyObject_TypeCheck(pval, &ldmud_closure_type))
+    if (PyObject_TypeCheck(pval, &ldmud_closure_type.type_base))
     {
         if (sval->type == T_CLOSURE)
             return closure_cmp(sval, &((ldmud_closure_t*)pval)->lpc_closure) == 0;
@@ -9890,7 +12911,7 @@ python_eq_svalue (PyObject* pval, svalue_t *sval)
             return false;
     }
 
-    if (PyObject_TypeCheck(pval, &ldmud_coroutine_type))
+    if (PyObject_TypeCheck(pval, &ldmud_coroutine_type.type_base))
     {
         if (sval->type == T_COROUTINE)
             return sval->u.coroutine == ((ldmud_coroutine_t*)pval)->lpc_coroutine;
@@ -9898,7 +12919,7 @@ python_eq_svalue (PyObject* pval, svalue_t *sval)
             return false;
     }
 
-    if (PyObject_TypeCheck(pval, &ldmud_symbol_type))
+    if (PyObject_TypeCheck(pval, &ldmud_symbol_type.type_base))
     {
         if (sval->type == T_SYMBOL)
         {
@@ -9910,7 +12931,7 @@ python_eq_svalue (PyObject* pval, svalue_t *sval)
             return false;
     }
 
-    if (PyObject_TypeCheck(pval, &ldmud_quoted_array_type))
+    if (PyObject_TypeCheck(pval, &ldmud_quoted_array_type.type_base))
     {
         if (sval->type == T_QUOTED_ARRAY)
         {
@@ -10075,6 +13096,94 @@ call_lpc_secure (CClosureFun fun, int num_arg, void* data)
 
     return result;
 } /* call_lpc_secure() */
+
+/*-------------------------------------------------------------------------*/
+static void
+raise_python_error (const char* prefix, bool thread_started)
+
+/* Raise an LPC error upon a Python exception.
+ * <thread_started> is true, if we need to finish a Python thread.
+ * This function will not return.
+ */
+
+{
+    /* Exception occurred. */
+    char buf[1024];
+    char *msg;
+
+    PyObject *exc_type, *exc_value, *exc_tb, *exc_str;
+    PyErr_Fetch(&exc_type, &exc_value, &exc_tb);
+
+    /* Make that exception into a string. */
+    exc_str = PyObject_Str(exc_value);
+    if (exc_str == NULL)
+        msg = "unknown exception";
+    else
+    {
+        /* And convert it to UTF-8 (for now). */
+        PyObject *exc_utf8;
+
+        exc_utf8 = PyUnicode_AsEncodedString(exc_str, "utf-8", "replace");
+        if (exc_utf8 == NULL)
+            msg = "undecodable exception";
+        else
+        {
+            /* Copy the message, because it may not
+             * exist after Py_DECREF.
+             */
+            strncpy(buf, PyBytes_AS_STRING(exc_utf8), sizeof(buf) - 1);
+            buf[sizeof(buf)-1] = 0;
+
+            msg = buf;
+
+            Py_DECREF(exc_utf8);
+        }
+
+        Py_DECREF(exc_str);
+    }
+
+    /* And print it to stdout. */
+    PyErr_Restore(exc_type, exc_value, exc_tb);
+    PyErr_Print();
+    PyErr_Clear();
+
+    python_finish_thread(thread_started);
+    errorf("%s: %s\n", prefix, msg);
+} /* raise_python_error() */
+
+/*-------------------------------------------------------------------------*/
+static bool
+python_start_thread ()
+
+/* Do anything necessary to execute Python code or access Python objects.
+ * This basically means acquiring the global interpreter lock. Returns
+ * true, if this function indeed started the thread (false if already
+ * in Python mode).
+ */
+
+{
+    if (!thread_state)
+        return false;
+
+    PyEval_RestoreThread(thread_state);
+    thread_state = NULL;
+    return true;
+} /* python_start_thread() */
+
+/*-------------------------------------------------------------------------*/
+static void
+python_finish_thread (bool started)
+
+/* Revert python_start_thread(), basically releasing the global interpreter
+ * lock. <started> is the return value of python_start_thread().
+ */
+
+{
+    if (!started)
+        return;
+
+    thread_state = PyEval_SaveThread();
+} /* python_finish_thread() */
 
 /*-------------------------------------------------------------------------*/
 #ifdef USE_PYTHON_CONTEXT
@@ -10361,6 +13470,10 @@ pkg_python_init (char* prog_name)
 
         Py_XDECREF(name);
     }
+
+    assert(sizeof(python_operation_fun) / sizeof(python_operation_fun[0]) == PYTHON_OPERATIONS_COUNT);
+
+    python_finish_thread(true);
 } /* pkg_python_init() */
 
 
@@ -10394,25 +13507,25 @@ check_python_efun_args (ident_t *p, int num_arg, bool has_ellipsis, fulltype_t *
 {
     python_efun_t * entry = python_efun_table + p->u.global.python_efun;
 
-    if (num_arg < entry->minarg && !has_ellipsis)
+    if (num_arg < entry->info.minarg && !has_ellipsis)
         yyerrorf("Too few arguments to %s", get_txt(p->name));
-    else if(!entry->varargs && num_arg > entry->maxarg)
+    else if(!entry->info.varargs && num_arg > entry->info.maxarg)
     {
         yyerrorf("Too many arguments to %s", get_txt(p->name));
-        num_arg = entry->maxarg;
+        num_arg = entry->info.maxarg;
     }
 
-    if (!entry->types)
+    if (!entry->info.types)
         return lpctype_mixed;
 
     for (int pos = 0; pos < num_arg; pos++)
     {
         lpctype_t* expected;
 
-        if (pos >= entry->maxarg)
-            expected = entry->types[1 + entry->maxarg];
+        if (pos >= entry->info.maxarg)
+            expected = entry->info.types[1 + entry->info.maxarg];
         else
-            expected = entry->types[1 + pos];
+            expected = entry->info.types[1 + pos];
 
         if (!expected)
             continue;
@@ -10426,53 +13539,44 @@ check_python_efun_args (ident_t *p, int num_arg, bool has_ellipsis, fulltype_t *
         }
     }
 
-    if (entry->types[0])
-        return entry->types[0];
+    if (entry->info.types[0])
+        return entry->info.types[0];
     return lpctype_mixed;
 
 } /* check_python_efun_args() */
 
 /*-------------------------------------------------------------------------*/
+static PyObject*
+build_python_efun_args (python_efun_info_t *efun_info, svalue_t *argp, int num_arg, const char* name, bool skip_first, bool thread_started)
 
-
-void
-call_python_efun (int idx, int num_arg)
-
-/* Call the python-defined efun <idx> with <num_arg> arguments on the stack.
- * This function removes the arguments from the stack and leaves the result
- * there.
+/* Check the <num_arg> arguments starting at <argp> against the type
+ * annotations in <efun_info> and raise any type error.
+ * On success build an argument tuple and return it.
+ * If <skip_first> is true, don't check and add the first argument.
  */
 
 {
-    PyObject *result, *args;
-    int pos;
-    svalue_t *argp;
-    bool was_external = python_is_external;
-    python_efun_t* python_efun_entry = python_efun_table + idx;
+    PyObject *args;
 
-    /* Efun still registered?
-     * (F_PYTHON_EFUN opcodes may still be floating around.)
-     */
-    if (python_efun_entry->callable == NULL)
-        errorf("Python-defined efun vanished: %s\n"
-             , get_txt(python_efun_entry->name->name));
+    if (!num_arg || (skip_first && num_arg == 1))
+        return NULL;
 
-    /* We leave the argument count check to Python.
-     * But we check the types if there are annotations about it.
-     */
-    args = num_arg ? PyTuple_New(num_arg) : NULL;
-    argp = inter_sp - num_arg + 1;
-    for (pos = 0; pos < num_arg; pos++,argp++)
+    args = PyTuple_New(num_arg - (skip_first ? 1 : 0));
+
+    for (int pos = 0; pos < num_arg; pos++,argp++)
     {
         PyObject *arg;
 
-        if (python_efun_entry->types)
+        if (skip_first && !pos)
+            continue;
+
+        if (efun_info->types)
         {
             lpctype_t *expected;
-            if (pos < python_efun_entry->maxarg)
-                expected = python_efun_entry->types[1 + pos];
-            else if (python_efun_entry->varargs)
-                expected = python_efun_entry->types[1 + python_efun_entry->maxarg];
+            if (pos < efun_info->maxarg)
+                expected = efun_info->types[1 + pos];
+            else if (efun_info->varargs)
+                expected = efun_info->types[1 + efun_info->maxarg];
             else
                 expected = NULL;
 
@@ -10484,9 +13588,10 @@ call_python_efun (int idx, int num_arg)
                 free_lpctype(realtype);
 
                 Py_DECREF(args);
+                python_finish_thread(thread_started);
 
                 errorf("Bad arg %d to %s(): got '%s', expected '%s'.\n"
-                      , pos + 1, get_txt(python_efun_entry->name->name)
+                      , pos + 1, name
                       , buff, get_lpctype_name(expected));
             }
         }
@@ -10494,71 +13599,65 @@ call_python_efun (int idx, int num_arg)
         arg = svalue_to_python(argp);
         if (arg == NULL)
         {
+            PyErr_Clear();
             Py_DECREF(args);
+            python_finish_thread(thread_started);
 
-            errorf("Bad argument %d to %s().\n"
-                 , pos+1
-                 , get_txt(python_efun_entry->name->name));
+            errorf("Bad argument %d to %s().\n", pos+1, name);
         }
-        PyTuple_SET_ITEM(args, pos, arg);
+        PyTuple_SET_ITEM(args, pos - (skip_first ? 1 : 0), arg);
     }
+
+    return args;
+} /* check_python_efun_args() */
+
+/*-------------------------------------------------------------------------*/
+void
+call_python_efun (int idx, int num_arg)
+
+/* Call the python-defined efun <idx> with <num_arg> arguments on the stack.
+ * This function removes the arguments from the stack and leaves the result
+ * there.
+ */
+
+{
+    PyObject *result, *args;
+    bool was_external = python_is_external;
+    bool started;
+    python_efun_t* python_efun_entry = python_efun_table + idx;
+
+    /* Efun still registered?
+     * (F_PYTHON_EFUN opcodes may still be floating around.)
+     */
+    if (python_efun_entry->callable == NULL)
+        errorf("Python-defined efun vanished: %s\n"
+             , get_txt(python_efun_entry->name->name));
+
+    started = python_start_thread();
+
+    /* We leave the argument count check to Python.
+     * But we check the types if there are annotations about it.
+     */
+    args = build_python_efun_args(&(python_efun_entry->info), inter_sp - num_arg + 1, num_arg, get_txt(python_efun_entry->name->name), false, started);
     inter_sp = pop_n_elems(num_arg, inter_sp);
 
     python_is_external = false;
     python_save_context();
     result = PyObject_CallObject(python_efun_entry->callable, args);
+    python_clear_context();
     python_is_external = was_external;
     Py_XDECREF(args);
 
     if (result == NULL)
     {
         /* Exception occurred. */
-        char buf[1024];
-        char *msg;
-
-        PyObject *exc_type, *exc_value, *exc_tb, *exc_str;
-        PyErr_Fetch(&exc_type, &exc_value, &exc_tb);
-
-        /* Make that exception into a string. */
-        exc_str = PyObject_Str(exc_value);
-        if (exc_str == NULL)
-            msg = "unknown exception";
-        else
-        {
-            /* And convert it to UTF-8 (for now). */
-            PyObject *exc_utf8;
-
-            exc_utf8 = PyUnicode_AsEncodedString(exc_str, "utf-8", "replace");
-            if (exc_utf8 == NULL)
-                msg = "undecodable exception";
-            else
-            {
-                /* Copy the message, because it may not
-                 * exist after Py_DECREF.
-                 */
-                strncpy(buf, PyBytes_AS_STRING(exc_utf8), sizeof(buf) - 1);
-                buf[sizeof(buf)-1] = 0;
-
-                msg = buf;
-
-                Py_DECREF(exc_utf8);
-            }
-
-            Py_DECREF(exc_str);
-        }
-
-        /* And print it to stdout. */
-        PyErr_Restore(exc_type, exc_value, exc_tb);
-        PyErr_Print();
-
-        errorf("%s: %s\n"
-             , get_txt(python_efun_entry->name->name)
-             , msg);
+        raise_python_error(get_txt(python_efun_entry->name->name), started);
     }
     else
     {
         const char *err = python_to_svalue(inter_sp + 1, result);
         Py_DECREF(result);
+        python_finish_thread(started);
 
         if (err != NULL)
         {
@@ -10580,6 +13679,8 @@ python_set_fds (fd_set *readfds, fd_set *writefds, fd_set *exceptfds, int *nfds)
  */
 
 {
+    bool started = python_start_thread();
+
     python_is_external = true;
     interrupt_execution = false;
     python_clear_context();
@@ -10623,6 +13724,7 @@ python_set_fds (fd_set *readfds, fd_set *writefds, fd_set *exceptfds, int *nfds)
         if((events & (POLLIN|POLLOUT|POLLPRI)) && *nfds <= fds->fd)
             (*nfds) = fds->fd + 1;
     }
+    python_finish_thread(started);
 } /* python_set_fds() */
 
 /*-------------------------------------------------------------------------*/
@@ -10635,6 +13737,7 @@ python_handle_fds (fd_set *readfds, fd_set *writefds, fd_set *exceptfds, int nfd
 
 {
     int num_cbs = 0, pos_cbs = 0;
+    bool started;
     PyObject **cb_funs, **cb_args;
 
     /* First count the number of calls we need to make. */
@@ -10658,6 +13761,8 @@ python_handle_fds (fd_set *readfds, fd_set *writefds, fd_set *exceptfds, int nfd
      */
     if (!cb_funs || !cb_args)
         return;
+
+    started = python_start_thread();
 
     for (python_poll_fds_t *fds = poll_fds; fds != NULL; fds = fds->next)
     {
@@ -10725,6 +13830,7 @@ python_handle_fds (fd_set *readfds, fd_set *writefds, fd_set *exceptfds, int nfd
 
     xfree(cb_funs);
     xfree(cb_args);
+    python_finish_thread(started);
 } /* python_handle_fds() */
 
 /*-------------------------------------------------------------------------*/
@@ -10735,6 +13841,7 @@ python_call_hook (int hook, bool is_external)
  */
 
 {
+    bool started = python_start_thread();
     bool was_external = python_is_external;
     python_is_external = is_external;
     if (is_external)
@@ -10760,7 +13867,9 @@ python_call_hook (int hook, bool is_external)
         Py_DECREF(result);
     }
 
+    python_clear_context();
     python_is_external = was_external;
+    python_finish_thread(started);
 } /* python_call_hook() */
 
 /*-------------------------------------------------------------------------*/
@@ -10771,11 +13880,13 @@ python_call_hook_object (int hook, bool is_external, object_t *ob)
  */
 
 {
+    bool started;
     bool was_external = python_is_external;
     PyObject *args, *arg;
     if (python_hooks[hook] == NULL)
         return;
 
+    started = python_start_thread();
     if (is_external)
     {
         python_clear_context();
@@ -10788,6 +13899,7 @@ python_call_hook_object (int hook, bool is_external, object_t *ob)
     if (args == NULL)
     {
         PyErr_Clear();
+        python_finish_thread(started);
         return;
     }
 
@@ -10796,6 +13908,7 @@ python_call_hook_object (int hook, bool is_external, object_t *ob)
     {
         PyErr_Clear();
         Py_DECREF(args);
+        python_finish_thread(started);
         return;
     }
 
@@ -10820,7 +13933,9 @@ python_call_hook_object (int hook, bool is_external, object_t *ob)
 
     Py_DECREF(args);
 
+    python_clear_context();
     python_is_external = was_external;
+    python_finish_thread(started);
 } /* python_call_hook_object() */
 
 /*-------------------------------------------------------------------------*/
@@ -10869,6 +13984,58 @@ python_handle_sigchld ()
 
 /*-------------------------------------------------------------------------*/
 void
+python_handle_signal (int sig)
+
+/* Called from the general signal handler for <sig>.
+ * We will remember that and handle it in the backend loop.
+ */
+
+{
+    comm_return_to_backend = true;
+    switch (sig)
+    {
+        case SIGINT:
+            python_pending_sigint = true;
+            break;
+
+        case SIGTERM:
+            python_pending_sigterm = true;
+            break;
+
+        case SIGHUP:
+            python_pending_sighup = true;
+            break;
+
+        case SIGUSR1:
+            python_pending_sigusr1 = true;
+            break;
+
+        case SIGUSR2:
+            python_pending_sigusr2 = true;
+            break;
+    }
+} /* python_handle_signal() */
+
+/*-------------------------------------------------------------------------*/
+void
+python_process_pending_signal (volatile bool *pending_flag, int hook)
+
+/* Process some pending signal if <*pending_flag> is true
+ * by calling <hook>.
+ */
+
+{
+    if (*pending_flag)
+    {
+        bool started = python_start_thread();
+        *pending_flag = false;
+        python_call_hook(hook, true);
+        python_finish_thread(started);
+    }
+} /* python_process_pending_signal() */
+
+/*-------------------------------------------------------------------------*/
+void
 python_process_pending_jobs ()
 
 /* Called from the backend to do some pending jobs,
@@ -10876,11 +14043,20 @@ python_process_pending_jobs ()
  */
 
 {
-    if (python_pending_sigchld)
+#if PY_VERSION_HEX >= 0x03040000
+    if (PyGILState_Check())
     {
-        python_pending_sigchld = false;
-        python_call_hook(PYTHON_HOOK_ON_SIGCHLD, true);
+        debug_message("%s Warning: Python GIL was held during backend loop.\n", time_stamp());
+        python_finish_thread(true);
     }
+#endif
+
+    python_process_pending_signal(&python_pending_sigchld, PYTHON_HOOK_ON_SIGCHLD);
+    python_process_pending_signal(&python_pending_sigint,  PYTHON_HOOK_ON_SIGINT);
+    python_process_pending_signal(&python_pending_sigterm, PYTHON_HOOK_ON_SIGTERM);
+    python_process_pending_signal(&python_pending_sighup,  PYTHON_HOOK_ON_SIGHUP);
+    python_process_pending_signal(&python_pending_sigusr1, PYTHON_HOOK_ON_SIGUSR1);
+    python_process_pending_signal(&python_pending_sigusr2, PYTHON_HOOK_ON_SIGUSR2);
 } /* python_process_pending_jobs() */
 
 /*-------------------------------------------------------------------------*/
@@ -10896,6 +14072,919 @@ closure_python_efun_to_string (int type)
 } /* closure_python_efun_to_string() */
 
 /*-------------------------------------------------------------------------*/
+ident_t*
+get_python_type_name (int python_type_id)
+
+/* Return the identifier that belongs to a registered python type.
+ */
+
+{
+    assert(python_type_table[python_type_id] != NULL);
+    return python_type_table[python_type_id]->name;
+} /* get_python_type_name() */
+
+/*-------------------------------------------------------------------------*/
+lpctype_t*
+lookup_python_type (int python_type_id)
+
+/* Called by the type functions to check whether our table has
+ * a LPC type pointer stored. This is done, so the lpctype_t object
+ * stays unique for each Python type.
+ */
+
+{
+    assert(python_type_table[python_type_id] != NULL);
+    return python_type_table[python_type_id]->lpctype;
+} /* lookup_python_type() */
+
+/*-------------------------------------------------------------------------*/
+void
+enter_python_type (int python_type_id, lpctype_t* lpctype)
+
+/* An LPC type object was created for <python_type_id>, enter it into
+ * our type table so we can reuse this type object later. The reference
+ * to the type is adopted.
+ */
+
+{
+    assert(python_type_table[python_type_id] != NULL);
+    assert(python_type_table[python_type_id]->lpctype == NULL);
+    python_type_table[python_type_id]->lpctype = lpctype;
+} /* enter_python_type() */
+
+/*-------------------------------------------------------------------------*/
+python_type_operation_t
+get_python_operation (int python_type_id, enum python_operation op)
+
+/* If the Python type <python_type_id> supports the Python operation <op>,
+ * return a structure with the return and operand type (borrowed references).
+ * Return a structure with NULL entries for unsupported operations.
+ */
+
+{
+    assert(python_type_table[python_type_id] != NULL);
+    return python_type_table[python_type_id]->op[op];
+} /* get_python_operation() */
+
+/*-------------------------------------------------------------------------*/
+lpctype_t*
+get_first_python_type(lpctype_t* type, void** cursor)
+
+/* Return the first Python type within <type> or NULL if there is none.
+ * <cursor> is a pointer for passing data to subsequent calls to
+ * get_next_python_type().
+ */
+
+{
+    *cursor = type;
+
+    return get_next_python_type(cursor);
+} /* get_first_python_type() */
+
+/*-------------------------------------------------------------------------*/
+lpctype_t*
+get_next_python_type(void** cursor)
+
+/* Return the next Python type after a call to get_first_python_type().
+ *
+ * <cursor> is a pointer to an lpctype_t*, where we need to continue
+ * looking.
+ */
+
+{
+    lpctype_t *curtype = *(lpctype_t**)cursor;
+    while (curtype != NULL)
+    {
+        lpctype_t *curbase;
+        if (curtype->t_class == TCLASS_UNION)
+        {
+            curbase = curtype->t_union.member;
+            curtype = curtype->t_union.head;
+        }
+        else
+        {
+            curbase = curtype;
+            curtype = NULL;
+        }
+
+        if (curbase->t_class == TCLASS_PYTHON)
+        {
+            *cursor = curtype;
+            return curbase;
+        }
+    }
+
+    *cursor = NULL;
+    return NULL;
+}
+
+/*-------------------------------------------------------------------------*/
+static python_efun_info_t*
+get_python_type_efun_info (int python_type_id, int efun)
+
+/* Returns the efun override information for the Python type <pytype>.
+ */
+
+{
+    int efun_idx;
+    python_efun_info_t *result;
+
+    assert(python_type_table[python_type_id] != NULL);
+
+    if (EFUN_OFFSET <= efun && efun < EFUN_OFFSET + EFUN_COUNT)
+        efun_idx = efun - EFUN_OFFSET;
+    else if (EFUN1_OFFSET <= efun && efun < EFUN1_OFFSET + EFUN1_COUNT)
+        efun_idx = EFUN_COUNT + efun - EFUN1_OFFSET;
+    else if (EFUN2_OFFSET <= efun && efun < EFUN2_OFFSET + EFUN2_COUNT)
+        efun_idx = EFUN_COUNT + EFUN1_COUNT + efun - EFUN2_OFFSET;
+    else if (EFUN3_OFFSET <= efun && efun < EFUN3_OFFSET + EFUN3_COUNT)
+        efun_idx = EFUN_COUNT + EFUN1_COUNT + EFUN2_COUNT + efun - EFUN3_OFFSET;
+    else if (EFUN4_OFFSET <= efun && efun < EFUN4_OFFSET + EFUN4_COUNT)
+        efun_idx = EFUN_COUNT + EFUN1_COUNT + EFUN2_COUNT + EFUN3_COUNT + efun - EFUN4_OFFSET;
+    else if (EFUNV_OFFSET <= efun && efun < EFUNV_OFFSET + EFUNV_COUNT)
+        efun_idx = EFUN_COUNT + EFUN1_COUNT + EFUN2_COUNT + EFUN3_COUNT + EFUN4_COUNT + efun - EFUNV_OFFSET;
+    else
+        return NULL;
+
+    result = python_type_table[python_type_id]->efun + efun_idx;
+    if (!result->exists)
+        return NULL;
+
+    return result;
+} /* get_python_type_efun_info() */
+
+/*-------------------------------------------------------------------------*/
+bool
+is_valid_arg_for_python_type_efun (lpctype_t *type, int efun, int pos, lpctype_t *argtype)
+
+/* Check the type <argtype> for the argument <pos> when calling the efun
+ * override for one of the Python types within <type>.
+ */
+
+{
+    void* cur;
+
+    for (lpctype_t *pytype = get_first_python_type(type, &cur);
+         pytype != NULL;
+         pytype = get_next_python_type(&cur))
+    {
+        assert(pytype->t_class == TCLASS_PYTHON);
+
+        python_efun_info_t* efun_info = get_python_type_efun_info(pytype->t_python.type_id, efun);
+        lpctype_t* expected;
+
+        /* No efun override. */
+        if (efun_info == NULL)
+            continue;
+
+        /* No type information, everything is allowed. */
+        if (efun_info->types == NULL)
+            return true;
+
+        /* First argument is <type> itself, so it's okay. */
+        if (pos == 1)
+            return true;
+
+        if (pos > efun_info->maxarg)
+            expected = efun_info->types[1 + efun_info->maxarg];
+        else
+            expected = efun_info->types[pos];
+
+        if (!expected)
+            return true;
+
+        if (has_common_type(expected, argtype))
+            return true;
+    }
+
+    return false;
+
+} /* is_valid_arg_for_python_type_efun() */
+
+/*-------------------------------------------------------------------------*/
+lpctype_t*
+add_result_for_python_type_efun (lpctype_t *type, int efun, lpctype_t *result)
+
+/* Add any result types for efun overrides of Python types within <type>
+ * to <result> and return it. The reference to <result> is adopted.
+ */
+
+{
+    void* cur;
+
+    if (result == lpctype_mixed)
+        return result;
+
+    for (lpctype_t *pytype = get_first_python_type(type, &cur);
+         pytype != NULL;
+         pytype = get_next_python_type(&cur))
+    {
+        assert(pytype->t_class == TCLASS_PYTHON);
+
+        python_efun_info_t* efun_info = get_python_type_efun_info(pytype->t_python.type_id, efun);
+        lpctype_t *oldresult = result;
+
+        if (efun_info == NULL)
+            continue;
+
+        if (efun_info->types == NULL || efun_info->types[0] == NULL)
+        {
+            free_lpctype(result);
+            return lpctype_mixed;
+        }
+
+        result = get_union_type(result, efun_info->types[0]);
+        free_lpctype(oldresult);
+    }
+
+    return result;
+} /* add_result_for_python_type_efun() */
+
+/*-------------------------------------------------------------------------*/
+bool
+python_ob_has_last_ref (svalue_t *pval)
+
+/* Return true, if this is the last reference to the Python object.
+ */
+
+{
+    bool started = python_start_thread();
+    bool result = Py_REFCNT((PyObject*)pval->u.generic) == 1;
+    python_finish_thread(started);
+    return result;
+} /* python_ob_has_last_ref() */
+
+/*-------------------------------------------------------------------------*/
+void
+ref_python_ob (svalue_t *pval)
+
+/* Increment the reference count to the given Python object.
+ */
+
+{
+    bool started = python_start_thread();
+    Py_INCREF((PyObject*)pval->u.generic);
+    num_lpc_python_references++;
+    python_finish_thread(started);
+} /* ref_python_ob() */
+
+/*-------------------------------------------------------------------------*/
+void
+free_python_ob (svalue_t *pval)
+
+/* Free a reference to the given Python object.
+ */
+
+{
+    bool started = python_start_thread();
+    Py_DECREF((PyObject*)pval->u.generic);
+    num_lpc_python_references--;
+    python_finish_thread(started);
+} /* free_python_ob() */
+
+/*-------------------------------------------------------------------------*/
+void
+copy_python_ob (svalue_t *dest, svalue_t *src)
+
+/* Put a copy of the python object <src> into dest <dest>.
+ * If the object is not copyable, a reference of <src> is put into <dest>.
+ */
+
+{
+    PyObject *fun;
+    bool started = python_start_thread();
+
+    assert(src->type == T_PYTHON);
+    assert(python_type_table[src->x.python_type] != NULL);
+
+    fun = PyObject_GetAttrString((PyObject*)src->u.generic, "__copy__");
+    if (fun == NULL)
+    {
+        PyErr_Clear();
+    }
+    else
+    {
+        PyObject* result;
+        bool was_external = python_is_external;
+
+        python_is_external = false;
+        python_save_context();
+
+        result = PyObject_CallObject(fun, NULL);
+
+        python_clear_context();
+        python_is_external = was_external;
+        Py_DECREF(fun);
+
+        if (result == NULL)
+            raise_python_error("copy", started);
+        else if (result == Py_NotImplemented)
+            Py_DECREF(result);
+        else
+        {
+            const char* err = python_to_svalue(dest, result);
+            Py_DECREF(result);
+
+            python_finish_thread(started);
+            if (err != NULL)
+                errorf("Bad return value from copy: %s\n", err);
+
+            return;
+        }
+    }
+
+    /* If we come here, the copy was not successful. */
+    *dest = *src;
+    ref_python_ob(src);
+
+    python_finish_thread(started);
+} /* copy_python_ob() */
+
+/*-------------------------------------------------------------------------*/
+bool
+save_python_ob (svalue_t *dest, string_t **name, svalue_t *ob)
+
+/* If the Python object <ob> is saveable, then return the actual value to
+ * save into <dest> (new reference) and the corresponding type name (borrowed
+ * reference) into <name> and return true. Return false if the object cannot
+ * be saved (then <dest> and <name> stay undefined).
+ */
+
+{
+    PyObject *fun;
+    bool started = python_start_thread();
+
+    assert(ob->type == T_PYTHON);
+    assert(python_type_table[ob->x.python_type] != NULL);
+
+    fun = PyObject_GetAttrString((PyObject*)ob->u.generic, "__save__");
+    if (fun == NULL)
+    {
+        PyErr_Clear();
+        python_finish_thread(started);
+        return false;
+    }
+    else
+    {
+        PyObject* result;
+        bool was_external = python_is_external;
+
+        python_is_external = false;
+        python_save_context();
+
+        result = PyObject_CallObject(fun, NULL);
+
+        python_clear_context();
+        python_is_external = was_external;
+        Py_DECREF(fun);
+
+        if (result == NULL)
+            raise_python_error("save", started);
+        else if (result == Py_NotImplemented)
+        {
+            Py_DECREF(result);
+            python_finish_thread(started);
+            return false;
+        }
+        else
+        {
+            const char* err = python_to_svalue(dest, result);
+            Py_DECREF(result);
+            python_finish_thread(started);
+
+            if (err != NULL)
+            {
+                return false;
+            }
+            if (dest->type == T_PYTHON)
+            {
+                free_svalue(dest);
+                *dest = const0;
+                return false;
+            }
+
+            *name = python_type_table[ob->x.python_type]->name->name;
+            return true;
+        }
+    }
+
+    return false; /* NOTREACHED */
+} /* save_python_ob() */
+
+/*-------------------------------------------------------------------------*/
+bool
+restore_python_ob (svalue_t *dest, string_t *name, svalue_t *value)
+
+/* Restore a Python object of type <name> from a save file/string with value
+ * <value>. The references of both values are adopted/freed, even in case
+ * of an error. Return true for success.
+ */
+
+{
+    bool was_external = python_is_external;
+    ident_t *ident;
+    PyObject *type, *fun, *arg, *args, *ob;
+    const char* err;
+    bool started;
+
+    /* Get the type for the type name. */
+    ident = find_shared_identifier_mstr(name, I_TYPE_PYTHON_TYPE, 0);
+    free_mstring(name);
+
+    if (!ident || ident->type != I_TYPE_PYTHON_TYPE)
+    {
+        free_svalue(value);
+        return false;
+    }
+
+    assert(python_type_table[ident->u.python_type_id] != NULL);
+
+    type = python_type_table[ident->u.python_type_id]->pytype;
+    if (type == NULL)
+    {
+        /* Registration for that type was removed. */
+        free_svalue(value);
+        return false;
+    }
+
+    /* Call __restore__ on the type object. We haven't checked whether the
+     * type actually has a __restore__(), we assume for now (as it has been
+     * saved somehow) that it has and check it later.
+     */
+
+    started = python_start_thread();
+    python_is_external = false;
+    python_save_context();
+
+    fun = PyObject_GetAttrString(type, "__restore__");
+    if (fun == NULL)
+    {
+        PyErr_Clear();
+        free_svalue(value);
+        python_is_external = was_external;
+        python_finish_thread(started);
+        return false;
+    }
+
+    args = PyTuple_New(1);
+    if (args == NULL)
+    {
+        PyErr_Clear();
+        Py_DECREF(fun);
+        free_svalue(value);
+        python_is_external = was_external;
+        python_finish_thread(started);
+        return false;
+    }
+
+    arg = svalue_to_python(value);
+    free_svalue(value);
+
+    if (arg == NULL)
+    {
+        PyErr_Clear();
+        Py_DECREF(fun);
+        Py_DECREF(args);
+        python_is_external = was_external;
+        python_finish_thread(started);
+        return false;
+    }
+
+    PyTuple_SET_ITEM(args, 0, arg);
+    ob = PyObject_CallObject(fun, args);
+
+    python_clear_context();
+    python_is_external = was_external;
+    Py_DECREF(fun);
+    Py_DECREF(args);
+
+    if (ob == NULL)
+    {
+        PyErr_Clear();
+        python_finish_thread(started);
+        return false;
+    }
+    else if (ob == Py_NotImplemented)
+    {
+        Py_DECREF(ob);
+        python_finish_thread(started);
+        return false;
+    }
+
+    /* And finally return the result. */
+    err = python_to_svalue(dest, ob);
+    Py_DECREF(ob);
+    python_finish_thread(started);
+
+    if (err != NULL)
+        return false;
+
+    return true;
+} /* restore_python_ob() */
+
+/*-------------------------------------------------------------------------*/
+string_t*
+python_ob_to_string (svalue_t *pval)
+
+/* Generate a printable string for the Python object.
+ */
+
+{
+    bool started = python_start_thread();
+    PyObject *repr = PyObject_Repr((PyObject*) pval->u.generic);
+
+    if (!repr)
+    {
+        PyErr_Print();
+        PyErr_Clear();
+    }
+    else if (PyUnicode_Check(repr))
+    {
+        string_t *str = python_string_to_string(repr);
+
+        if (str != NULL)
+        {
+            Py_DECREF(repr);
+            python_finish_thread(started);
+            return str;
+        }
+    }
+
+    Py_XDECREF(repr);
+    python_finish_thread(started);
+
+    return ref_mstring(get_python_type_name(pval->x.python_type)->name);
+} /* python_ob_to_string() */
+
+/*-------------------------------------------------------------------------*/
+static svalue_t*
+do_single_python_operation (svalue_t *sp, svalue_t *arg1, svalue_t *arg2, bool reverse, enum python_operation op, const char* op_name)
+
+/* Execute the operation <op> on <arg1> and <arg2> (which are the topmost
+ * values on <sp>). Pop elements from the stack and push the result on it,
+ * returning the new stack pointer. Throw errors upon any (also type) errors.
+ * Return NULL when no matching operation available.
+ */
+
+{
+    python_type_operation_t *py_op;
+
+    if (arg1->type != T_PYTHON)
+        return NULL;
+
+    assert(python_type_table[arg1->x.python_type] != NULL);
+    py_op = python_type_table[arg1->x.python_type]->op + op;
+    if (py_op->returntype == NULL)
+        return NULL;
+
+    if (check_rtt_compatibility(py_op->argtype, arg2))
+    {
+        bool started = python_start_thread();
+        PyObject *arg = svalue_to_python(arg2);
+        PyObject *fun, *args, *result;
+
+        if (arg == NULL)
+        {
+            PyErr_Clear();
+            python_finish_thread(started);
+
+            inter_sp = sp;
+            errorf("Bad %s argument to %s.\n", reverse ? "left" : "right", op_name);
+        }
+
+        fun = PyObject_GetAttrString((PyObject*)arg1->u.generic, python_operation_fun[op].name);
+        args = PyTuple_New(1);
+
+        if (fun && args)
+        {
+            bool was_external = python_is_external;
+
+            PyTuple_SET_ITEM(args, 0, arg);
+
+            python_is_external = false;
+            python_save_context();
+            result = PyObject_CallObject(fun, args);
+            python_clear_context();
+            python_is_external = was_external;
+
+            if (result == NULL)
+            {
+                inter_sp = sp;
+                raise_python_error(python_operation_fun[op].name, started);
+            }
+            else if (result == Py_NotImplemented)
+            {
+                Py_DECREF(result);
+                result = NULL;
+            }
+        }
+        else
+        {
+            result = NULL;
+            Py_XDECREF(arg);
+            PyErr_Clear();
+        }
+
+        Py_XDECREF(args);
+        Py_XDECREF(fun);
+
+        if (result != NULL)
+        {
+            const char* err;
+
+            sp = pop_n_elems(2, sp);
+            err = python_to_svalue(sp+1, result);
+            Py_DECREF(result);
+            python_finish_thread(started);
+
+            if (err != NULL)
+            {
+                inter_sp = sp;
+                errorf("Bad return value from %s: %s\n", op_name, err);
+            }
+
+            return sp+1;
+        }
+
+        python_finish_thread(started);
+    }
+
+    return NULL;
+} /* do_single_python_operation() */
+
+/*-------------------------------------------------------------------------*/
+static void
+raise_single_python_op_arg_error (svalue_t *sp, svalue_t *arg1, svalue_t *arg2, bool reverse, enum python_operation op, const char* op_name)
+
+/* Throw an argument error for Python operation <op>.
+ */
+
+{
+    python_type_operation_t *py_op = python_type_table[arg1->x.python_type]->op + op;
+
+    inter_sp = sp;
+
+    if (py_op->returntype == NULL)
+    {
+        errorf("Unsupported operation %s for %s.\n",
+            op_name, get_txt(python_type_table[arg1->x.python_type]->name->name));
+    }
+    else
+    {
+        static char buff[512];
+
+        lpctype_t *realtype = get_rtt_type(py_op->argtype, arg2);
+        get_lpctype_name_buf(realtype, buff, sizeof(buff));
+        free_lpctype(realtype);
+
+        errorf("Bad %s argument to %s: got '%s', expected '%s'.\n",
+            reverse ? "left" : "right", op_name,
+            buff, get_lpctype_name(py_op->argtype));
+    }
+} /* raise_single_python_op_arg_error() */
+
+/*-------------------------------------------------------------------------*/
+svalue_t*
+do_python_unary_operation (svalue_t *sp, enum python_operation op, const char* op_name)
+
+/* Execute the operation <op> on sp[0]. Pop it from the stack and
+ * push the result on it. Throw errors upon any errors.
+ */
+
+{
+    python_type_operation_t *py_op = python_type_table[sp->x.python_type]->op + op;
+
+    if (py_op->returntype != NULL)
+    {
+        bool started = python_start_thread();
+        PyObject *fun = PyObject_GetAttrString((PyObject*)sp->u.generic, python_operation_fun[op].name);
+        if (fun)
+        {
+            bool was_external = python_is_external;
+            PyObject *result;
+
+            python_is_external = false;
+            python_save_context();
+            result = PyObject_CallObject(fun, NULL);
+            python_clear_context();
+            python_is_external = was_external;
+
+            Py_DECREF(fun);
+
+            if (result == NULL)
+            {
+                inter_sp = sp;
+                raise_python_error(python_operation_fun[op].name, started);
+            }
+            else if (result == Py_NotImplemented)
+            {
+                Py_DECREF(result);
+            }
+            else
+            {
+                const char* err;
+
+                free_svalue(sp);
+                err = python_to_svalue(sp, result);
+                Py_DECREF(result);
+                python_finish_thread(started);
+
+                if (err != NULL)
+                {
+                    inter_sp = sp-1;
+                    errorf("Bad return value from %s: %s\n", op_name, err);
+                }
+
+                return sp;
+            }
+        }
+        else
+            PyErr_Clear();
+        python_finish_thread(started);
+    }
+
+    errorf("Unsupported operation %s for %s.\n",
+        op_name, get_txt(python_type_table[sp->x.python_type]->name->name));
+
+    return NULL; /* NOTREACHED */
+
+} /* do_python_unary_operation() */
+
+/*-------------------------------------------------------------------------*/
+svalue_t*
+do_python_binary_operation (svalue_t *sp, enum python_operation op, enum python_operation rop, const char* op_name)
+
+/* Execute the operation <op> or reverse operation <rop> on sp[-1] and sp[0].
+ * Pop elements from the stack and push the result on it, returning the new
+ * stack pointer. Throw errors upon any (also type) errors.
+ *
+ * If both values are python objects and provide a corresponding operation,
+ * we might try both if the first one reports NotImplemented.
+ */
+
+{
+    svalue_t *result;
+
+    result = do_single_python_operation(sp, sp-1, sp, false, op, op_name);
+    if (result)
+        return result;
+
+    result = do_single_python_operation(sp, sp, sp-1, true, rop, op_name);
+    if (result)
+        return result;
+
+    /* Now generate some error message. */
+    if (sp[-1].type == T_PYTHON)
+        raise_single_python_op_arg_error(sp, sp-1, sp, false, op, op_name);
+    else
+    {
+        assert(sp[0].type == T_PYTHON);
+        raise_single_python_op_arg_error(sp, sp, sp-1, true, rop, op_name);
+    }
+
+    return NULL; /* NOTREACHED */
+} /* do_python_binary_operation() */
+
+/*-------------------------------------------------------------------------*/
+svalue_t *
+do_python_assignment_operation (svalue_t *sp, svalue_t *dest, enum python_operation iop, enum python_operation op, enum python_operation rop, const char* op_name)
+
+/* Execute an assignment operation <iop> on the Python object <dest>
+ * with sp[-1]. If not successful, try normal operations <op> and <rop>.
+ * Remove the arguments from the stack and return the result on the
+ * stack (or throw an error).
+ */
+
+{
+    svalue_t * result;
+
+    result = do_single_python_operation(sp, dest, sp-1, false, iop, op_name);
+    if (result != NULL)
+    {
+        assign_svalue(dest, result);
+        return result;
+    }
+
+    result = do_single_python_operation(sp, dest, sp-1, false, op, op_name);
+    if (result)
+    {
+        assign_svalue(dest, result);
+        return result;
+    }
+
+    result = do_single_python_operation(sp, sp-1, dest, true, rop, op_name);
+    if (result)
+    {
+        assign_svalue(dest, result);
+        return result;
+    }
+
+    /* Now generate some error message. */
+    if (dest->type == T_PYTHON)
+    {
+        if (python_type_table[dest->x.python_type]->op[iop].returntype != NULL)
+            raise_single_python_op_arg_error(sp, dest, sp-1, false, iop, op_name);
+        else
+            raise_single_python_op_arg_error(sp, dest, sp-1, false, op, op_name);
+    }
+    else
+    {
+        assert(sp[-1].type == T_PYTHON);
+        raise_single_python_op_arg_error(sp, sp-1, dest, true, rop, op_name);
+    }
+
+    return NULL; /* NOTREACHED */
+} /* do_python_assignment_operation() */
+
+/*-------------------------------------------------------------------------*/
+svalue_t*
+call_python_type_efun(svalue_t *sp, int efun, int num_arg)
+
+/* Check whether the first argument on the stack <sp> is a Python object,
+ * if so call any efun override for it. Return the new stack pointer
+ * on success, NULL if no override was found.
+ * If the original efun returns lpctype_void, then also this function
+ * will not leave a result on the stack.
+ */
+
+{
+    svalue_t *arg = sp - num_arg + 1;
+    python_efun_info_t* efun_info;
+    char funname[64];
+    PyObject *fun, *args, *result;
+    bool started;
+    bool was_external = python_is_external;
+
+    if (num_arg == 0)
+        return NULL;
+
+    if (arg->type != T_PYTHON)
+        return NULL;
+
+    assert(python_type_table[arg->x.python_type] != NULL);
+
+    efun_info = get_python_type_efun_info(arg->x.python_type, efun);
+    if (efun_info == NULL)
+        return NULL;
+
+    started = python_start_thread();
+
+    /* Check the arguments. */
+    inter_sp = sp;
+    args = build_python_efun_args(efun_info, arg, num_arg, instrs[efun].name, true, started);
+
+    /* Object (still) does have this fun? */
+    snprintf(funname, sizeof(funname), "__efun_%s__", instrs[efun].name);
+    fun = PyObject_GetAttrString((PyObject*)arg->u.generic, funname);
+
+    if (!fun || !PyCallable_Check(fun))
+    {
+        Py_XDECREF(fun);
+        Py_XDECREF(args);
+        PyErr_Clear();
+        python_finish_thread(started);
+        return NULL;
+    }
+
+    /* Do the call. */
+    inter_sp = pop_n_elems(num_arg, inter_sp);
+
+    python_is_external = false;
+    python_save_context();
+    result = PyObject_CallObject(fun, args);
+    python_clear_context();
+    python_is_external = was_external;
+    Py_XDECREF(fun);
+    Py_XDECREF(args);
+
+    if (result == NULL)
+    {
+        /* Exception occurred. */
+        raise_python_error(instrs[efun].name, started);
+    }
+    else if (instrs[efun].ret_type != lpctype_void)
+    {
+        const char *err = python_to_svalue(inter_sp + 1, result);
+        Py_DECREF(result);
+
+        if (err != NULL)
+        {
+            python_finish_thread(started);
+            errorf("Bad return value from %s(): %s\n"
+                  , instrs[efun].name
+                  , err);
+        }
+
+        inter_sp++;
+    }
+    else
+        Py_DECREF(result);
+
+    python_finish_thread(started);
+    return inter_sp;
+} /* call_python_type_efun() */
+
+/*-------------------------------------------------------------------------*/
 void
 python_free_object (object_t *ob)
 
@@ -10903,8 +14992,13 @@ python_free_object (object_t *ob)
  */
 
 {
+
     if (ob->python_dict != NULL)
+    {
+        bool started = python_start_thread();
         Py_DECREF((PyObject*) ob->python_dict);
+        python_finish_thread(started);
+    }
 } /* python_free_object() */
 
 /*-------------------------------------------------------------------------*/
@@ -10920,8 +15014,11 @@ python_free_replace_program_protector (replace_ob_t *r_ob)
     while (prpp)
     {
         struct python_replace_program_protector *next = prpp->next;
+        bool started = python_start_thread();
 
         Py_DECREF(prpp->ref);
+        python_finish_thread(started);
+
         xfree(prpp);
 
         prpp = next;
@@ -10963,6 +15060,7 @@ python_replace_program_adjust (replace_ob_t *r_ob)
     while (prpp)
     {
         struct python_replace_program_protector *next = prpp->next;
+        bool started = python_start_thread();
 
         /* At least one more reference, otherwise we don't need to care. */
         if (prpp->ref->ob_refcnt > 1)
@@ -10978,6 +15076,8 @@ python_replace_program_adjust (replace_ob_t *r_ob)
         }
 
         Py_DECREF(prpp->ref);
+        python_finish_thread(started);
+
         xfree(prpp);
 
         prpp = next;
@@ -10991,6 +15091,7 @@ cleanup_python_data (cleanup_t * context)
 /* Cleanup any Python-held LPC values. */
 
 {
+    bool started = python_start_thread();
     for(ldmud_gc_var_t* var = gc_object_list; var != NULL; var = var->gcnext)
     {
         object_t* ob = ((ldmud_object_t*)var)->lpc_object;
@@ -11080,6 +15181,7 @@ cleanup_python_data (cleanup_t * context)
         cleanup_vector(&((ldmud_lvalue_t*)var)->lpc_lvalue, 1, context);
     }
 
+    python_finish_thread(started);
 } /* cleanup_python_data() */
 
 #ifdef GC_SUPPORT
@@ -11092,11 +15194,33 @@ python_clear_refs ()
  */
 
 {
+    bool started = python_start_thread();
+
     for (int idx = 0; idx < PYTHON_EFUN_TABLE_SIZE; idx++)
     {
-        if (python_efun_table[idx].types)
-            for (int pos = 0; pos < 1 + python_efun_table[idx].maxarg + (python_efun_table[idx].varargs ? 1 : 0); pos++)
-                clear_lpctype_ref(python_efun_table[idx].types[pos]);
+        if (python_efun_table[idx].info.types)
+            for (int pos = 0; pos < 1 + python_efun_table[idx].info.maxarg + (python_efun_table[idx].info.varargs ? 1 : 0); pos++)
+                clear_lpctype_ref(python_efun_table[idx].info.types[pos]);
+    }
+
+    for (int idx = 0; idx < PYTHON_TYPE_TABLE_SIZE; idx++)
+    {
+        if (python_type_table[idx] != NULL)
+        {
+            clear_lpctype_ref(python_type_table[idx]->lpctype);
+
+            for (int op = 0; op < PYTHON_OPERATIONS_COUNT; op++)
+            {
+                clear_lpctype_ref(python_type_table[idx]->op[op].returntype);
+                clear_lpctype_ref(python_type_table[idx]->op[op].argtype);
+            }
+
+            for (int efun = 0; efun < REAL_EFUN_COUNT; efun++)
+                if (python_type_table[idx]->efun[efun].exists
+                 && python_type_table[idx]->efun[efun].types)
+                    for (int pos = 0; pos < 1 + python_type_table[idx]->efun[efun].maxarg + (python_type_table[idx]->efun[efun].varargs ? 1 : 0); pos++)
+                        clear_lpctype_ref(python_type_table[idx]->efun[efun].types[pos]);
+        }
     }
 
     for(ldmud_gc_var_t* var = gc_object_list; var != NULL; var = var->gcnext)
@@ -11181,6 +15305,18 @@ python_clear_refs ()
     {
         clear_ref_in_vector(&((ldmud_lvalue_t*)var)->lpc_lvalue, 1);
     }
+
+    for(ldmud_gc_lpctype_type_t* var = gc_lpctype_list; var != NULL; var = var->gcnext)
+    {
+        clear_lpctype_ref(var->type);
+    }
+
+    for(ldmud_concrete_struct_type_t* var = gc_struct_type_list; var != NULL; var = var->gcnext)
+    {
+        clear_struct_name_ref(var->name);
+    }
+
+    python_finish_thread(started);
 } /* python_clear_refs() */
 
 /*-------------------------------------------------------------------------*/
@@ -11191,15 +15327,42 @@ python_count_refs ()
  */
 
 {
+    bool started = python_start_thread();
+
     /* The efun table */
     for (int idx = 0; idx < PYTHON_EFUN_TABLE_SIZE; idx++)
     {
-        if (python_efun_table[idx].types)
+        if (python_efun_table[idx].info.types)
         {
-            note_malloced_block_ref(python_efun_table[idx].types);
+            note_malloced_block_ref(python_efun_table[idx].info.types);
 
-            for (int pos = 0; pos < 1 + python_efun_table[idx].maxarg + (python_efun_table[idx].varargs ? 1 : 0); pos++)
-                count_lpctype_ref(python_efun_table[idx].types[pos]);
+            for (int pos = 0; pos < 1 + python_efun_table[idx].info.maxarg + (python_efun_table[idx].info.varargs ? 1 : 0); pos++)
+                count_lpctype_ref(python_efun_table[idx].info.types[pos]);
+        }
+    }
+
+    /* The type table */
+    for (int idx = 0; idx < PYTHON_TYPE_TABLE_SIZE; idx++)
+    {
+        if (python_type_table[idx] != NULL)
+        {
+            note_malloced_block_ref(python_type_table[idx]);
+            count_lpctype_ref(python_type_table[idx]->lpctype);
+            for (int op = 0; op < PYTHON_OPERATIONS_COUNT; op++)
+            {
+                count_lpctype_ref(python_type_table[idx]->op[op].returntype);
+                count_lpctype_ref(python_type_table[idx]->op[op].argtype);
+            }
+
+            for (int efun = 0; efun < REAL_EFUN_COUNT; efun++)
+                if (python_type_table[idx]->efun[efun].exists
+                 && python_type_table[idx]->efun[efun].types)
+                {
+                    note_malloced_block_ref(python_type_table[idx]->efun[efun].types);
+
+                    for (int pos = 0; pos < 1 + python_type_table[idx]->efun[efun].maxarg + (python_type_table[idx]->efun[efun].varargs ? 1 : 0); pos++)
+                        count_lpctype_ref(python_type_table[idx]->efun[efun].types[pos]);
+                }
         }
     }
 
@@ -11326,6 +15489,18 @@ python_count_refs ()
     {
         count_ref_in_vector(&((ldmud_lvalue_t*)var)->lpc_lvalue, 1);
     }
+
+    for(ldmud_gc_lpctype_type_t* var = gc_lpctype_list; var != NULL; var = var->gcnext)
+    {
+        count_lpctype_ref(var->type);
+    }
+
+    for(ldmud_concrete_struct_type_t* var = gc_struct_type_list; var != NULL; var = var->gcnext)
+    {
+        count_struct_name_ref(var->name);
+    }
+
+    python_finish_thread(started);
 } /* python_count_refs() */
 
 #endif /* GC_SUPPORT */
@@ -11338,6 +15513,8 @@ count_python_extra_refs ()
  */
 
 {
+    bool started = python_start_thread();
+
     /* All Python objects that reference LPC data. */
     for(ldmud_gc_var_t* var = gc_object_list; var != NULL; var = var->gcnext)
     {
@@ -11423,6 +15600,8 @@ count_python_extra_refs ()
     {
         count_extra_ref_in_vector(&((ldmud_lvalue_t*)var)->lpc_lvalue, 1);
     }
+
+    python_finish_thread(started);
 } /* count_python_extra_refs() */
 
 #endif /* DEBUG */

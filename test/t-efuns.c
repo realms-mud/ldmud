@@ -1,11 +1,15 @@
+#pragma save_types
+
 #define OWN_PRIVILEGE_VIOLATION
 
 #include "/inc/base.inc"
 #include "/inc/testarray.inc"
 #include "/inc/gc.inc"
 #include "/inc/deep_eq.inc"
+// String compiler header boundary
 #include "/sys/tls.h"
 #include "/sys/configuration.h"
+#include "/sys/driver_hook.h"
 #include "/sys/functionlist.h"
 #include "/sys/input_to.h"
 #include "/sys/lpctypes.h"
@@ -14,6 +18,7 @@
 #include "/sys/struct_info.h"
 
 #define TESTFILE "/log/testfile"
+// String compiler header boundary
 
 struct test_struct
 {
@@ -24,6 +29,8 @@ struct derived_struct (test_struct)
 {
     string* values;
 };
+
+struct cs_opts (compile_string_options) {};
 
 mapping json_testdata = ([ "test 1": 42, "test 2": 42.0,
                           "test 3": "hello world\n",
@@ -55,7 +62,9 @@ string last_privi_op;
 mixed last_privi_who;
 mixed* last_privi_args;
 
-mixed *tests = ({
+mixed *tests =
+// String compiler test boundary
+({
     // TODO: Add cases for indexing at string end ("abc"[3])
     ({ "[ 1", 0,        (: ({1,2,3,4,5})[4] == 5 :) }),
     ({ "[ 2", TF_ERROR, (: ({1,2,3,4,5})[5] :) }),
@@ -244,6 +253,27 @@ mixed *tests = ({
     ({ "call_direct_resolved array 2",  0, (: int* result; return deep_eq(call_direct_resolved(&result, ({clone,clone,object_name(clone),this_object(),0}), "g", 10, ({ 20 })), ({0, 0, 0, 0, 0})) && deep_eq(result, ({  0,  0,  0,  0, 0})); :) }),
     ({ "call_direct_resolved array 3",  0, (: int* result; return deep_eq(call_direct_resolved(&result, ({clone,clone,object_name(clone),this_object(),0}), "h", 10, ({ 20 })), ({0, 0, 0, 0, 0})) && deep_eq(result, ({  0,  0,  0,  0, 0})); :) }),
     ({ "call_out", 0, (: last_rt_warning = 0; call_out("ThisFunctionDoesNotExist", 10); return sizeof(last_rt_warning); :) }),
+    ({ "catch 1", 0,                       (: catch(throw(''X)) == ''X                    :) }),
+    ({ "catch 2", 0,                       (: catch(raise_error("X")) == "*X"             :) }),
+    ({ "catch 3", 0,                       (: catch(1+1) == 0                             :) }),
+    ({ "catch 4", 0,                       (: int x; return catch(x=20) == 0 && x == 20;  :) }),
+    ({ "catch 5", 0,                       (: int eval; catch(eval = get_eval_cost(); limit 5000); return eval > 4900 && eval < 5000; :) }),
+    ({ "catch 6", 0,                       (: int eval; catch(eval = get_eval_cost(); reserve 1000, limit 4000); return eval > 3900 && eval < 4000; :) }),
+    ({ "catch 7", 0,                       (: int eval; catch(eval = get_eval_cost(); limit 3000, reserve 1000); return eval > 2900 && eval < 3000; :) }),
+    ({ "check_type 1", 0,                  (: check_type(10,[int])                   == 1 :) }),
+    ({ "check_type 2", 0,                  (: check_type(10,[int|float])             == 1 :) }),
+    ({ "check_type 3", 0,                  (: check_type(10,[string])                == 0 :) }),
+    ({ "check_type 4", 0,                  (: check_type(10,[mixed])                 == 1 :) }),
+    ({ "check_type 5", 0,                  (: check_type(10,[void])                  == 0 :) }),
+    ({ "check_type 6", 0,                  (: check_type(({10}),[int*])              == 1 :) }),
+    ({ "check_type 7", 0,                  (: check_type(({10}),[string*])           == 0 :) }),
+    ({ "check_type 8", 0,                  (: check_type(({10}),[<int|string>*])     == 1 :) }),
+    ({ "check_type 9", 0,                  (: check_type(({10}),[int*|string*])      == 1 :) }),
+    ({ "check_type 10", 0,                 (: check_type(({10}),[int*|string*])      == 1 :) }),
+    ({ "check_type 11", 0,                 (: check_type(({10,"X"}),[<int|string>*]) == 1 :) }),
+    ({ "check_type 12", 0,                 (: check_type(({10,"X"}),[int*|string*])  == 0 :) }),
+    ({ "check_type 13", 0,                 (: check_type(({10}),[mixed])             == 1 :) }),
+    ({ "check_type 14", 0,                 (: check_type(({10}),[mixed*])            == 1 :) }),
     ({ "crypt", TF_ERROR,  (: crypt("ABC", "$$") :) }),
     ({ "ctime", TF_DONTCHECKERROR,  (: ctime(-1) :) }), /* This must be the first ctime call of this test suite. */
     ({ "clone_object 1", 0,
@@ -312,6 +342,534 @@ mixed *tests = ({
             destruct(o);
             return res == 52;
         :)
+    }),
+    ({ "compile_string (simple expression)", 0,
+       (:
+            return funcall(compile_string(0, "1+1"))==2;
+       :)
+    }),
+    ({ "compile_string (expression with parameters)", 0,
+       (:
+            return funcall(compile_string(({'a,'b}), "a+2*b"),3,5)==13;
+       :)
+    }),
+    ({ "compile_string (duplicate parameters)", TF_ERROR,
+       (:
+            compile_string(({'a,'a}), "a");
+            return 0;
+       :)
+    }),
+    ({ "compile_string (string and symbol literals)", 0,
+       (:
+            return deep_eq(funcall(compile_string(0, "({\"A\", \"B\", 'c, ''d})")), ({"A","B",'c,''d}));
+       :)
+    }),
+    ({ "compile_string (many string literals)", 0,
+       (:
+            /* Test the closure value hash table. */
+            string* arr = ({0}) * 0x200;
+            foreach (int i: 0x200)
+                arr[i] = to_string(i);
+            return deep_eq(funcall(compile_string(0,
+                "({" + implode(map(arr, function string(string a) { return "\"" + a + "\""; }), ",\n") + "})")),
+                arr);
+       :)
+    }),
+    ({ "compile_string (inline closure)", 0,
+       (:
+            return funcall(funcall(compile_string(({'a}), "function int(int b) { return a + 2*b; }"), 3), 5) == 13;
+       :)
+    }),
+    ({ "compile_string (inline closure with optional args)", 0,
+       (:
+            return funcall(funcall(compile_string(({'a}), "function string(string b = \"Y\") { return a + 2*b + \"Z\"; }"), "X")) == "XYYZ";
+       :)
+    }),
+    ({ "compile_string (inline closure with optional args and context)", 0,
+       (:
+            return funcall(funcall(compile_string(({'a}), "function string(string b = \"Y\") : string c = \"Z\" { return a + 2*b + c; }"), "X")) == "XYYZ";
+       :)
+    }),
+    ({ "compile_string (inline closure with vararg argument)", 0,
+       (:
+            return funcall(funcall(compile_string(0, "function string(varargs string* b) { return implode(b, \"-\"); }")), "X", "Y", "Z") == "X-Y-Z";
+       :)
+    }),
+    ({ "compile_string (old inline closure)", 0,
+       (:
+            return funcall(funcall(compile_string(({'a}), "(: a + 2*$1 :)"), 3), 5) == 13;
+       :)
+    }),
+    ({ "compile_string (coroutine)", 0,
+       (:
+            coroutine cr = funcall(compile_string(0, "async function string() { foreach (string s: ({\"A\",\"B\",\"C\"})) yield(s); return \"Z\"; }"));
+
+            if (call_coroutine(cr) != "A")
+                return 0;
+            if (call_coroutine(cr) != "B")
+                return 0;
+            if (call_coroutine(cr) != "C")
+                return 0;
+            if (call_coroutine(cr) != "Z")
+                return 0;
+            if (cr)
+                return 0;
+            return 1;
+       :)
+    }),
+    ({ "compile_string (RTTCs) 1", 0,
+       (:
+            return funcall(compile_string(({'a}), "#pragma rtt_checks\n({int})a"), 11) == 11;
+       :)
+    }),
+    ({ "compile_string (RTTCs) 2", TF_ERROR,
+       (:
+            funcall(compile_string(({'a}), "#pragma rtt_checks\n({int})a"), "X");
+       :)
+    }),
+    ({ "compile_string (illegal options)", TF_ERROR,
+       (:
+            struct mixed opts = (<test_struct>);
+            compile_string(0, "1+1", opts);
+       :)
+    }),
+    ({ "compile_string (empty options)", 0,
+       (:
+            return funcall(compile_string(0, "1+1", (<compile_string_options>)))==2;
+       :)
+    }),
+    ({ "compile_string (function from mapping)", 0,
+       (:
+            return funcall(compile_string(0, "fun1() + fun2(\"z\")", (<cs_opts>
+                functions:
+                    ([
+                        'fun1: function string() { return "ABC"; },
+                        'fun2: #'capitalize
+                    ])))) == "ABCZ";
+       :)
+    }),
+    ({ "compile_string (function from function)", 0,
+       (:
+            return funcall(compile_string(0, "fun1() + fun2(\"z\")", (<cs_opts>
+                functions: function closure(symbol name)
+                    {
+                        switch (to_string(name))
+                        {
+                            case "fun1":
+                                return function string() { return "ABC"; };
+                            case "fun2":
+                                return #'capitalize;
+                        }
+                    }))) == "ABCZ";
+       :)
+    }),
+    ({ "compile_string (missing function from function)", TF_ERROR,
+       (:
+            compile_string(0, "fun1() + fun2(\"z\")", (<cs_opts>
+                functions: function closure(symbol name)
+                    {
+                        if (name == 'fun1)
+                            return function string() { return "ABC"; };
+                    }));
+       :)
+    }),
+    ({ "compile_string (function from object)", 0,
+       (:
+            return funcall(compile_string(0, "f(41)", (<cs_opts> use_object_functions: 1))) == 42;
+       :)
+    }),
+    ({ "compile_string (function from object and mapping)", 0,
+       (:
+            return funcall(compile_string(0, "f(41)", (<cs_opts>
+                use_object_functions: 1,
+                functions: (['f: (: $1+2 :)])))) == 43;
+       :)
+    }),
+    ({ "compile_string (function not from object)", TF_ERROR,
+       (:
+            compile_string(0, "f(41)");
+       :)
+    }),
+    ({ "compile_string (closure from mapping)", 0,
+       (:
+            return funcall(compile_string(0, "#'fun2", (<cs_opts>
+                functions:
+                    ([
+                        'fun2: #'capitalize
+                    ])))) == #'capitalize;
+       :)
+    }),
+    ({ "compile_string (closure from object)", 0,
+       (:
+            return funcall(compile_string(0, "#'f", (<cs_opts> use_object_functions: 1))) == #'f;
+       :)
+    }),
+    ({ "compile_string (closure from object and mapping)", 0,
+       (:
+            return funcall(compile_string(0, "#'f", (<cs_opts>
+                use_object_functions: 1,
+                functions: (['f: #'max])))) == #'max;
+       :)
+    }),
+    ({ "compile_string (closure not from object)", TF_ERROR,
+       (:
+            compile_string(0, "#'f");
+       :)
+    }),
+    ({ "compile_string (variable from mapping)", 0,
+       (:
+            string v1 = "ABC", v2;
+            return funcall(compile_string(0, "var1 + (var2 = \"X\")", (<cs_opts>
+                variables:
+                    ([
+                        'var1: &v1,
+                        'var2: &v2,
+                    ])))) == "ABCX" && v2 == "X";
+       :)
+    }),
+    ({ "compile_string (variable from function)", 0,
+       (:
+            string v1 = "ABC", v2;
+            return funcall(compile_string(0, "var1 + (var2 = \"X\")", (<cs_opts>
+                variables: function mixed(symbol name) : string v2 = &v2
+                    {
+                        switch (to_string(name))
+                        {
+                            case "var1": return &v1;
+                            case "var2": return &v2;
+                        }
+                    }))) == "ABCX" && v2 == "X";
+       :)
+    }),
+    ({ "compile_string (variable, missing in function)", TF_ERROR,
+       (:
+            string v1 = "ABC";
+            compile_string(0, "var1 + var2", (<cs_opts>
+                variables: function mixed(symbol name)
+                    {
+                        if (name == 'var1)
+                            return &v1;
+                    }));
+       :)
+    }),
+    ({ "compile_string (variable from object)", 0,
+       (:
+            global_var = "ABC";
+            return funcall(compile_string(0, "global_var + (global_var = \"X\")", (<cs_opts>
+                            use_object_variables: 1))) == "ABCX"
+                && global_var == "X";
+       :)
+    }),
+    ({ "compile_string (variable from object and mapping)", 0,
+       (:
+            string local_var = "ABC";
+            global_var = "-";
+            return funcall(compile_string(0, "global_var + (global_var = \"X\")", (<cs_opts>
+                            use_object_variables: 1,
+                            variables: (['global_var: &local_var])))) == "ABCX"
+                && local_var == "X";
+       :)
+    }),
+    ({ "compile_string (variable not from object)", TF_ERROR,
+       (:
+            compile_string(0, "global_var");
+       :)
+    }),
+    ({ "compile_string (identifier closure from mapping)", TF_ERROR,
+       (:
+            string v;
+            compile_string(0, "#'var", (<cs_opts> variables: (['var: &v])));
+            return 0;
+       :)
+    }),
+    ({ "compile_string (identifier closure from object)", 0,
+       (:
+            return funcall(compile_string(0, "#'global_var", (<cs_opts> use_object_variables: 1))) == #'global_var;
+       :)
+    }),
+    ({ "compile_string (identifier closure from object and mapping)", TF_ERROR,
+       (:
+            string v;
+            funcall(compile_string(0, "#'global_var", (<cs_opts>
+                use_object_variables: 1,
+                variables: (['global_var: &v]))));
+       :)
+    }),
+    ({ "compile_string (identifier closure not from object)", TF_ERROR,
+       (:
+            compile_string(0, "#'global_var");
+       :)
+    }),
+    ({ "compile_string (struct from mapping)", 0,
+       (:
+            return deep_eq(funcall(compile_string(0, "(<my_struct> ({10}))", (<cs_opts>
+                structs:
+                    ([
+                        'my_struct: (<test_struct> ({-1})),
+                    ])))), (<test_struct> ({10})));
+       :)
+    }),
+    ({ "compile_string (struct from function)", 0,
+       (:
+            return deep_eq(funcall(compile_string(0, "(<my_struct> ({10}))", (<cs_opts>
+                structs: function struct mixed(symbol name)
+                    {
+                        if (name == 'my_struct)
+                            return (<test_struct> ({-1}));
+                    }))), (<test_struct> ({10})));
+       :)
+    }),
+    ({ "compile_string (missing struct from function)", TF_ERROR,
+       (:
+            compile_string(0, "(<my_struct> ({10}))", (<cs_opts>
+                structs: function struct mixed(symbol name)
+                    {
+                        return 0;
+                    }));
+       :)
+    }),
+    ({ "compile_string (struct from object)", 0,
+       (:
+            return deep_eq(funcall(compile_string(0, "(<test_struct> ({10}))", (<cs_opts> use_object_structs: 1))),
+                           (<test_struct> ({10})));
+       :)
+    }),
+    ({ "compile_string (struct from object and mapping)", 0,
+       (:
+            return deep_eq(funcall(compile_string(0, "(<test_struct> ({10}), ({\"X\"}))", (<cs_opts>
+                                    use_object_structs: 1,
+                                    structs: (['test_struct: (<derived_struct>)])))),
+                           (<derived_struct> ({10}), ({"X"})));
+       :)
+    }),
+    ({ "compile_string (struct not from object)", TF_ERROR,
+       (:
+            compile_string(0, "(<test_struct> ({11}))");
+       :)
+    }),
+    ({ "compile_string (struct member lookup)", 0,
+       (:
+            return funcall(compile_string(0, "get_struct().values[1]", (<cs_opts> use_object_functions: 1)))=="B";
+       :)
+    }),
+    ({ "compile_string (these tests)", 0,
+       (:
+            string file = read_file(__FILE__, 0, 0, "UTF-8");
+            string header = explode(file, "// String compiler header boundary\n")[1];
+            string code = explode(file, "// String compiler test boundary\n")[1];
+            return pointerp(funcall(compile_string(0, "#define TF_ERROR 1\n#define TF_DONTCHECKERROR 2\n" + header + code, (<cs_opts>
+                use_object_functions: 1,
+                use_object_variables: 1,
+                use_object_structs: 1))));
+       :)
+    }),
+    ({ "compile_string with decltype of these tests", 0,
+       (:
+            string file = read_file(__FILE__, 0, 0, "UTF-8");
+            string header = explode(file, "// String compiler header boundary\n")[1];
+            string code = explode(file, "// String compiler test boundary\n")[1];
+            return funcall(compile_string(0, "#define TF_ERROR 1\n#define TF_DONTCHECKERROR 2\n" + header + "decltype(" + code + ")", (<cs_opts>
+                use_object_functions: 1,
+                use_object_variables: 1,
+                use_object_structs: 1))) in [mixed*];
+       :)
+    }),
+    ({ "compile_string (expression with end detection) 1", 0,
+       (:
+            string expr = "1+1!";
+            return funcall(compile_string(0, &expr, (<cs_opts>
+                detect_end: 1))) == 2 && expr == "!";
+       :)
+    }),
+    ({ "compile_string (expression with end detection) 2", 0,
+       (:
+            string expr = "1+1";
+            return funcall(compile_string(0, &expr, (<cs_opts>
+                detect_end: 1))) == 2 && expr == "";
+       :)
+    }),
+    ({ "compile_string (expression with end detection) 3", 0,
+       (:
+            string expr = "1+1@";
+            return funcall(compile_string(0, &expr, (<cs_opts>
+                detect_end: 1))) == 2 && expr == "@";
+       :)
+    }),
+    ({ "compile_string (expression with end detection) 4", 0,
+       (:
+            string expr = "\"LD\" \"Mud\"!";
+            return funcall(compile_string(0, &expr, (<cs_opts>
+                detect_end: 1))) == "LDMud" && expr == "!";
+       :)
+    }),
+    ({ "compile_string (expression with end detection) 5", 0,
+       (:
+            string expr = "\"LD\" \"Mud\"";
+            return funcall(compile_string(0, &expr, (<cs_opts>
+                detect_end: 1))) == "LDMud" && expr == "";
+       :)
+    }),
+    ({ "compile_string (expression with end detection) 6", 0,
+       (:
+            string exprs = "10, 20+30, \",\" ";
+            mixed *result = ({});
+
+            while (sizeof(exprs))
+            {
+                result += ({ funcall(compile_string(0, &exprs, (<cs_opts> detect_end: 1))) });
+                exprs = trim(exprs);
+                if (sizeof(exprs) && exprs[0] == ',')
+                    exprs = trim(exprs[1..]);
+            }
+
+            return deep_eq(result, ({10, 50, ","}));
+       :)
+    }),
+    ({ "compile_string (expression with end detection) 7", 0,
+       (:
+            string expr = "#define VALUE 42 \nVALUE;";
+            return funcall(compile_string(0, &expr, (<cs_opts> detect_end: 1))) == 42 && expr == ";";
+       :)
+    }),
+    ({ "compile_string (expression with end detection) 8", TF_ERROR,
+       (:
+            string expr = "#define VALUE 42 52\nVALUE";
+            funcall(compile_string(0, &expr, (<cs_opts> detect_end: 1)));
+       :)
+    }),
+    ({ "compile_string (simple block)", 0,
+       (:
+            return funcall(compile_string(0, "return 42;", (<cs_opts> compile_block: 1)))==42;
+       :)
+    }),
+    ({ "compile_string (simple variable declarations)", 0,
+       (:
+            return funcall(compile_string(({'a}), "int i = 10; return a+i;", (<cs_opts> compile_block: 1)), 32)==42;
+       :)
+    }),
+    ({ "compile_string (RTTCs in a block)", TF_ERROR,
+       (:
+            funcall(compile_string(({'a}), "#pragma rtt_checks\nint i = a; return i;", (<cs_opts> compile_block: 1)), "X");
+       :)
+    }),
+    ({ "compile_string (struct (from object) variable declarations)", 0,
+       (:
+            return funcall(compile_string(0, "struct test_struct x = (<test_struct> ({11})); return x.arg[0];", (<cs_opts>
+                compile_block: 1,
+                use_object_structs: 1)))==11;
+       :)
+    }),
+    ({ "compile_string (struct (from mapping) variable declarations)", 0,
+       (:
+            return funcall(compile_string(0, "struct my_struct x = (<my_struct> ({12})); return x.arg[0];", (<cs_opts>
+                compile_block: 1,
+                structs:
+                    ([
+                        'my_struct: (<test_struct> ({-1})),
+                    ]))))==12;
+       :)
+    }),
+    ({ "compile_string (range coroutine)", 0,
+       (:
+            coroutine cr = funcall(compile_string(({'start,'stop}),
+                "for (int i = start; i < stop; i++) yield(i);", (<cs_opts>
+                    compile_block: 1,
+                    as_async: 1)), 1, 10);
+            int sum;
+            foreach (int num: cr)
+                sum += num;
+            return sum == 45;
+       :)
+    }),
+    ({ "compile_string (this_coroutine)", 0,
+       (:
+            coroutine cr = funcall(compile_string(0, "yield(this_coroutine())", (<cs_opts> as_async: 1)));
+            return call_coroutine(cr) == cr;
+       :)
+    }),
+    ({ "compile_string (with H_AUTO_INCLUDE_EXPRESSION as string)", 0,
+       (:
+            set_driver_hook(H_AUTO_INCLUDE_EXPRESSION, "#define VALUE 42\n");
+            return funcall(compile_string(0, "VALUE")) == 42;
+       :)
+    }),
+    ({ "compile_string (with H_AUTO_INCLUDE_EXPRESSION as closure)", 0,
+       (:
+            set_driver_hook(H_AUTO_INCLUDE_EXPRESSION, function string(object ob, string file, int sys)
+            {
+                if (ob != this_object())
+                    return 0;
+                if (!file)
+                    return "#define VALUE 42\n";
+                if (file[0] != '/')
+                    file = "/" + file;
+                return "#define LAST_INCLUDE \"" + file + "\"\n";
+            });
+            return deep_eq(funcall(compile_string(0, "#include \"/sys/configuration.h\"\n({VALUE,LAST_INCLUDE})")),
+                           ({42,"/sys/configuration.h"}));
+       :)
+    }),
+    ({ "compile_string (with H_AUTO_INCLUDE_BLOCK as string)", 0,
+       (:
+            set_driver_hook(H_AUTO_INCLUDE_BLOCK, "#define VALUE 42\n");
+            return funcall(compile_string(0, "return VALUE;", (<cs_opts> compile_block: 1))) == 42;
+       :)
+    }),
+    ({ "compile_string (with H_AUTO_INCLUDE_BLOCK as closure)", 0,
+       (:
+            set_driver_hook(H_AUTO_INCLUDE_BLOCK, function string(object ob, string file, int sys)
+            {
+                if (ob != this_object())
+                    return 0;
+                if (!file)
+                    return "#define VALUE 42\n";
+                if (file[0] != '/')
+                    file = "/" + file;
+                return "#define LAST_INCLUDE \"" + file + "\"\n";
+            });
+            return deep_eq(funcall(compile_string(0, "#include \"/sys/configuration.h\"\nreturn ({VALUE,LAST_INCLUDE});", (<cs_opts> compile_block: 1))),
+                           ({42,"/sys/configuration.h"}));
+       :)
+    }),
+    ({ "compile_string (recursion)", TF_ERROR,
+       (:
+            compile_string(0, "X()", (<cs_opts>
+                functions: function closure(symbol name)
+                {
+                    return compile_string(0, "1+1");
+                }));
+       :)
+    }),
+    ({ "compile_string (block with end detection) 1", 0,
+       (:
+            string expr = "return 42;\n===";
+            return funcall(compile_string(0, &expr, (<cs_opts>
+                compile_block: 1,
+                detect_end: 1))) == 42 && expr == "\n===";
+       :)
+    }),
+    ({ "compile_string (block with end detection) 2", 0,
+       (:
+            string expr = "return 42;";
+            return funcall(compile_string(0, &expr, (<cs_opts>
+                compile_block: 1,
+                detect_end: 1))) == 42 && expr == "";
+       :)
+    }),
+    ({ "compile_string (block with end detection) 3", 0,
+       (:
+            string expr = "return 42;\n@";
+            return funcall(compile_string(0, &expr, (<cs_opts>
+                compile_block: 1,
+                detect_end: 1))) == 42 && expr == "\n@";
+       :)
+    }),
+    ({ "compile_string (block with end detection and this end in H_AUTO_INCLUDE_BLOCK)", TF_ERROR,
+       (:
+            /* As the end is not in the string itself, this should throw. */
+            set_driver_hook(H_AUTO_INCLUDE_BLOCK, "return 42;\n@");
+            compile_string(0, "", (<cs_opts> compile_block: 1, detect_end: 1));
+       :)
     }),
     ({ "configure_interactive (privileged)", 0,
        (:
@@ -428,10 +986,31 @@ mixed *tests = ({
                               "'return <value>' statement") ==
                          "902588f647e39421f274f94303e7d397bda55cd12b562d36e51ffb37f59d17e63edc77443dfb3a0e92996215b82ae067b1a700f3356baeb513cd619ce05b9a39" :)
     }),
-    ({ "hash string (RIPEMD160)", 0, (:
-                         hash(TLS_HASH_RIPEMD160, "line 13: Warning: Missing "
-                              "'return <value>' statement") ==
-                         "fe9de95923c1200b31db7905d997a81e121c7640" :)
+    ({ "hash string (RIPEMD160)", 0,
+        (:
+            string str;
+            /* Might not be supported by OpenSSL anymore. */
+            if (catch(str = hash(TLS_HASH_RIPEMD160, "line 13: Warning: Missing "
+                              "'return <value>' statement")))
+                return 1;
+            return str == "fe9de95923c1200b31db7905d997a81e121c7640";
+        :)
+    }),
+    ({ "hmac (SHA1) 1",    0, (: hmac(TLS_HASH_SHA1,      "LDMud", "Data")           == "20e110fa593df97bdf1c39af53d90c8d4b39ae12" :) }),
+    ({ "hmac (SHA1) 2",    0, (: hmac(TLS_HASH_SHA1,     b"LDMud", b"Data")          == "20e110fa593df97bdf1c39af53d90c8d4b39ae12" :) }),
+    ({ "hmac (SHA1) 3",    0, (: hmac(TLS_HASH_SHA1,      "LDMud", ({68,97,116,97})) == "20e110fa593df97bdf1c39af53d90c8d4b39ae12" :) }),
+    ({ "hmac (SHA224)",    0, (: hmac(TLS_HASH_SHA224,    "LDMud", "Data") == "856f849af90a540804140cf06a7d7399301c034f9714382fbf6f0ba5" :) }),
+    ({ "hmac (SHA256)",    0, (: hmac(TLS_HASH_SHA256,    "LDMud", "Data") == "605c5218001dfa8178109bd9f7a3c50c69bfcebc25f4c7419e209fdecaad737d" :) }),
+    ({ "hmac (SHA384)",    0, (: hmac(TLS_HASH_SHA384,    "LDMud", "Data") == "1c729213077a8a024a72d979b34a56ae3cfb050036ec20141d67bdd6370140fc8520a0c9e06e9a88c0a523e340c6b0a2" :) }),
+    ({ "hmac (SHA512)",    0, (: hmac(TLS_HASH_SHA512,    "LDMud", "Data") == "450f0707e2539451413150d19f1146abb75ff11c7d842d5c860c6d47a4ba743429e0bfc5b5ac25f8de46b68ef452bdc4c1312b473a366c147ca2a7abc0464524" :) }),
+    ({ "hmac (MD5)",       0, (: hmac(TLS_HASH_MD5,       "LDMud", "Data") == "59af8cdc963113ee6680f33944e81557" :) }),
+    ({ "hmac (RIPEMD160)", 0,
+        (:
+            string str;
+            if (catch(str = hmac(TLS_HASH_RIPEMD160, "LDMud", "Data")))
+                return 1;
+            return str == "92b0b388aa915819fadeb5558cbe2901fcf187e1";
+        :)
     }),
 #endif
     ({ "write_file 1", 0, 
@@ -657,6 +1236,48 @@ mixed *tests = ({
     ({ "sprintf doc41", 0, (: sprintf("%8.3G",123.5)             == "     124"      :) }),
     ({ "sprintf doc42", 0, (: sprintf("%8.6g",123.5)             == "   123.5"      :) }),
 
+    ({ "to_array 1", 0, (: deep_eq(to_array([int]),           ({ [int] }))           :) }),
+    ({ "to_array 2", 0, (: deep_eq(to_array([void]),          ({ [void] }))          :) }),
+    ({ "to_array 3", 0, (: deep_eq(to_array([int*]),          ({ [int*] }))          :) }),
+    ({ "to_array 4", 0, (: deep_eq(to_array([<int|string>*]), ({ [<int|string>*] })) :) }),
+    ({ "to_array 5", 0, (: deep_eq(mkmapping(to_array([int|string])),        ([ [int], [string]          ])) :) }),
+    ({ "to_array 6", 0, (: deep_eq(mkmapping(to_array([int|float|string])),  ([ [int], [float], [string] ])) :) }),
+    ({ "to_array 7", 0, (: deep_eq(mkmapping(to_array([int|<int|string>*])), ([ [int], [<int|string>*]   ])) :) }),
+
+    ({ "to_lpctype 1",  0, (: to_lpctype("int") == [int] :) }),
+    ({ "to_lpctype 2",  0, (: to_lpctype("<int>") == [int] :) }),
+    ({ "to_lpctype 3",  0, (: to_lpctype("<<int>>") == [int] :) }),
+    ({ "to_lpctype 4",  0, (: to_lpctype("int|string") == [int|string] :) }),
+    ({ "to_lpctype 5",  0, (: to_lpctype("string|int") == [int|string] :) }),
+    ({ "to_lpctype 6",  0, (: to_lpctype("mixed") == [mixed] :) }),
+    ({ "to_lpctype 7",  0, (: to_lpctype("void") == [void] :) }),
+    ({ "to_lpctype 8",  0, (: to_lpctype("struct mixed") == [struct mixed] :) }),
+    ({ "to_lpctype 9",  0, (: to_lpctype("struct test_struct") == [struct test_struct] :) }),
+    ({ "to_lpctype 10",  0, (: to_lpctype("struct compile_string_options") == [struct compile_string_options] :) }),
+    ({ "to_lpctype 11",  0, (: to_lpctype("int**") == [int**] :) }),
+    ({ "to_lpctype 12",  0, (: to_lpctype("<int*|string>*") == [<int*|string>*] :) }),
+    ({ "to_lpctype 13",  0, (: to_lpctype("object") == [object] :) }),
+    ({ "to_lpctype 14",  0, (: to_lpctype("lwobject") == [lwobject] :) }),
+    ({ "to_lpctype 15",  0, (: to_lpctype("lwobject \"/object/\u00c4\"") == [lwobject "/object/\u00c4"] :) }),
+    ({ "to_lpctype 16",  TF_ERROR, (: to_lpctype("stuff") :) }),
+    ({ "to_lpctype 17",  TF_ERROR, (: to_lpctype("int what") :) }),
+    ({ "to_lpctype 18",  TF_ERROR, (: to_lpctype("<int> what") :) }),
+    ({ "to_lpctype 17",  TF_ERROR, (: to_lpctype("int>") :) }),
+    ({ "to_lpctype 18",  TF_ERROR, (: to_lpctype("struct whatever") :) }),
+
+    ({ "to_string(lpctype) 1",  0, (: to_lpctype(to_string([int])) == [int] :) }),
+    ({ "to_string(lpctype) 2",  0, (: to_lpctype(to_string([string|int])) == [int|string] :) }),
+    ({ "to_string(lpctype) 3",  0, (: to_lpctype(to_string([mixed])) == [mixed] :) }),
+    ({ "to_string(lpctype) 4",  0, (: to_lpctype(to_string([void])) == [void] :) }),
+    ({ "to_string(lpctype) 5",  0, (: to_lpctype(to_string([struct mixed])) == [struct mixed] :) }),
+    ({ "to_string(lpctype) 6",  0, (: to_lpctype(to_string([struct test_struct])) == [struct test_struct] :) }),
+    ({ "to_string(lpctype) 7",  0, (: to_lpctype(to_string([struct compile_string_options])) == [struct compile_string_options] :) }),
+    ({ "to_string(lpctype) 8",  0, (: to_lpctype(to_string([int**])) == [int**] :) }),
+    ({ "to_string(lpctype) 9",  0, (: to_lpctype(to_string([<int*|string>*])) == [<int*|string>*] :) }),
+    ({ "to_string(lpctype) 10",  0, (: to_lpctype(to_string([object])) == [object] :) }),
+    ({ "to_string(lpctype) 11",  0, (: to_lpctype(to_string([lwobject])) == [lwobject] :) }),
+    ({ "to_string(lpctype) 12",  0, (: to_lpctype(to_string([lwobject "/object/\u00c4"])) == [lwobject "/object/\u00c4"] :) }),
+
     ({ "to_text 1", 0, (: deep_eq(to_array(to_text( ({}) )), ({}) ) :) }),
     ({ "to_text 2", 0, (: deep_eq(to_array(to_text( ({0, 65, 66, 67}) )), ({0, 65, 66, 67}) ) :) }),
     ({ "to_text 3", 0, (: deep_eq(to_array(to_text( copy(({65, 66, 67, "ABC"})) )), ({65, 66, 67}) ) :) }),
@@ -831,6 +1452,17 @@ mixed *tests = ({
                 ([1:"a";"b", 2:"c";"d"]),
                 to_struct((["a":1, "b": 4, "c": 16])),
                 to_struct(({1,2,3})),
+
+                [void],
+                [float],
+                [float|object],
+                [lpctype],
+                [struct mixed],
+                [struct test_struct],
+                [struct compile_string_options],
+                [string**],
+                [<symbol*|string>*],
+                [lwobject "/A/\"\n\""],
             }))
             {
                 if(!deep_eq(val, restore_value(save_value(val))))
@@ -906,6 +1538,7 @@ mixed *tests = ({
     ({ "variable_list 4", 0, (: deep_eq(variable_list(this_object(), RETURN_FUNCTION_NAME | RETURN_FUNCTION_TYPE), 
                                 ({ "last_rt_warning", TYPE_MOD_POINTER|TYPE_STRING, "json_testdata", TYPE_MAPPING, "json_teststring", TYPE_STRING, "b", TYPE_BYTES, "dhe_testdata", TYPE_STRING, "global_var", TYPE_ANY, "clone", TYPE_OBJECT, "last_privi_op", TYPE_STRING, "last_privi_who", TYPE_ANY, "last_privi_args", TYPE_MOD_POINTER|TYPE_ANY, "tests", TYPE_MOD_POINTER|TYPE_ANY, "args", TYPE_NUMBER })) :) }),
     ({ "variable_list 5", 0, (: variable_list(this_object(), RETURN_VARIABLE_VALUE)[3] == b"\x00" :) }),
+    ({ "variable_list 6", 0, (: deep_eq(variable_list(this_object(), RETURN_FUNCTION_LPCTYPE), ({ [string*],                  [mapping],       [string],          [bytes],          [string],       [mixed],      [object],    [string],         [mixed],          [mixed*],                  [mixed*],                  [int] })) :) }),
 
 #ifdef __JSON__
     ({ "json_parse/_serialize 1", 0,
@@ -987,7 +1620,9 @@ mixed *tests = ({
            return 1; :) }),
 })) + ({
 #endif // __TLS__
-});
+})
+// String compiler test boundary
+;
 
 void run_test()
 {
@@ -1046,4 +1681,9 @@ void create_clone(int arg1, int arg2)
 int get_args()
 {
     return args;
+}
+
+struct derived_struct get_struct()
+{
+    return (<derived_struct> ({11,12}), ({"A","B"}));
 }
