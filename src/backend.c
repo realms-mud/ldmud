@@ -115,19 +115,19 @@ volatile mp_int total_alarms = 0;
   /* The total number of alarm()s so far, incremented from the alarm handler.
    */
 
-uint32 total_player_commands = 0;
+uint32_t total_player_commands = 0;
   /* Total number of player commands so far.
    */
 
-uint num_listed_objs = 0;
+uint32_t num_listed_objs = 0;
   /* Number of objects in the object list.
    */
 
-uint num_last_processed = 0;
+uint32_t num_last_processed = 0;
   /* Number of object processed in last process_objects().
    */
 
-uint num_last_data_cleaned = 0;
+uint32_t num_last_data_cleaned = 0;
   /* Number of object data-cleaned in last process_objects().
    */
 
@@ -373,6 +373,11 @@ handle_signal (int sig)
             break;
     }
 
+#ifdef USE_PYTHON
+    /* Notify the python package. Python will not react immediately. */
+    python_handle_signal(sig);
+#endif
+
     switch (action)
     {
         case DCS_IGNORE:
@@ -602,10 +607,10 @@ cleanup_stuff (void)
             lambda_t *l;
 
             l = driver_hook[i].u.lambda;
-            if (l->ob.type != T_OBJECT || l->ob.u.ob != master_ob)
+            if (l->base.ob.type != T_OBJECT || l->base.ob.u.ob != master_ob)
             {
-                free_svalue(&(l->ob));
-                put_ref_object(&(l->ob), master_ob, "backend");
+                free_svalue(&(l->base.ob));
+                put_ref_object(&(l->base.ob), master_ob, "backend");
             }
         }
     }

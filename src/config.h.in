@@ -506,6 +506,9 @@
  */
 #define DEFMAX                   @val_defmax@
 
+/* Enable 'in' as a keyword.
+ */
+@cdef_keyword_in@ KEYWORD_IN
 
 /* --- Internal Tables --- */
 

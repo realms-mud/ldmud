@@ -229,6 +229,7 @@
 #include "simulate.h"
 #include "simul_efun.h"
 #include "stdstrings.h"
+#include "stdstructs.h"
 #include "strfuns.h"
 #include "structs.h"
 #include "svalue.h"
@@ -436,6 +437,8 @@ static const char * svalue_typename[]
    , /* T_BYTES  */         "bytes"
    , /* T_LWOBJECT */       "lwobject"
    , /* T_COROUTINE */      "coroutine"
+   , /* T_PYTHON */         "python-object"
+   , /* T_LPCTYPE */        "lpctype"
    , /* T_CALLBACK */       "callback"
    , /* T_ERROR_HANDLER */  "error-handler"
    , /* T_BREAK_ADDR */     "break-address"
@@ -1229,6 +1232,16 @@ int_free_svalue (svalue_t *v)
         free_coroutine(v->u.coroutine);
         break;
 
+#ifdef USE_PYTHON
+    case T_PYTHON:
+        free_python_ob(v);
+        break;
+#endif
+
+    case T_LPCTYPE:
+        free_lpctype(v->u.lpctype);
+        break;
+
     case T_CALLBACK:
         free_callback(v->u.cb);
         xfree(v->u.cb);
@@ -1427,6 +1440,12 @@ free_svalue (svalue_t *v)
             break;
         }
         break;
+
+#ifdef USE_PYTHON
+    case T_PYTHON:
+        needs_deserializing = python_ob_has_last_ref(v);
+        break;
+#endif
     }
 
     /* If the value doesn't need de-serializing, it can be
@@ -1511,7 +1530,6 @@ _destructed_object_ref (svalue_t *svp)
 
         case T_CLOSURE:
         {
-            lambda_t *l;
             int type;
 
             if (!CLOSURE_MALLOCED(type = svp->x.closure_type))
@@ -1522,20 +1540,18 @@ _destructed_object_ref (svalue_t *svp)
                     return (svp->u.ob->flags & O_DESTRUCTED) ? MY_TRUE : MY_FALSE;
             }
 
-            /* Lambda closure */
+            /* Allocated closure */
 
-            l = svp->u.lambda;
-
-            if (CLOSURE_HAS_CODE(type) && type == CLOSURE_UNBOUND_LAMBDA)
+            if (type == CLOSURE_UNBOUND_LAMBDA)
                 return MY_FALSE;
 
             if (type == CLOSURE_LFUN
-             && l->function.lfun.ob.type == T_OBJECT
-             && (l->function.lfun.ob.u.ob->flags & O_DESTRUCTED))
+             && svp->u.lfun_closure->fun_ob.type == T_OBJECT
+             && (svp->u.lfun_closure->fun_ob.u.ob->flags & O_DESTRUCTED))
                 return MY_TRUE;
 
-            if (l->ob.type == T_OBJECT
-             && (l->ob.u.ob->flags & O_DESTRUCTED))
+            if (svp->u.closure->ob.type == T_OBJECT
+             && (svp->u.closure->ob.u.ob->flags & O_DESTRUCTED))
                 return MY_TRUE;
 
             return MY_FALSE;
@@ -1569,7 +1585,6 @@ inl_object_ref (svalue_t *svp, object_t *obj)
 
         case T_CLOSURE:
         {
-            lambda_t *l;
             int type;
 
             if (!CLOSURE_MALLOCED(type = svp->x.closure_type))
@@ -1580,20 +1595,18 @@ inl_object_ref (svalue_t *svp, object_t *obj)
                     return svp->u.ob == obj;
             }
 
-            /* Lambda closure */
+            /* Allocated closure */
 
-            l = svp->u.lambda;
-
-            if (CLOSURE_HAS_CODE(type) && type == CLOSURE_UNBOUND_LAMBDA)
+            if (type == CLOSURE_UNBOUND_LAMBDA)
                 return MY_FALSE;
 
             if (type == CLOSURE_LFUN
-             && l->function.lfun.ob.type == T_OBJECT
-             && l->function.lfun.ob.u.ob == obj)
+             && svp->u.lfun_closure->fun_ob.type == T_OBJECT
+             && svp->u.lfun_closure->fun_ob.u.ob == obj)
                 return MY_TRUE;
 
-            if (l->ob.type == T_OBJECT
-             && l->ob.u.ob == obj)
+            if (svp->u.closure->ob.type == T_OBJECT
+             && svp->u.closure->ob.u.ob == obj)
                 return MY_TRUE;
 
             return MY_FALSE;
@@ -1686,7 +1699,12 @@ internal_assign_svalue_no_free (svalue_t *to, svalue_t *from)
         break;
 
     case T_CLOSURE:
-        addref_closure(to, "ass to var");
+        if (CLOSURE_MALLOCED(to->x.closure_type))
+            to->u.closure->ref++;
+        else if (to->x.closure_type < CLOSURE_LWO)
+            ref_lwobject(to->u.lwob);
+        else
+            ref_object(to->u.ob, "ass to var");
         break;
 
     case T_COROUTINE:
@@ -1698,6 +1716,10 @@ internal_assign_svalue_no_free (svalue_t *to, svalue_t *from)
 
     case T_MAPPING:
         (void)ref_mapping(to->u.map);
+        break;
+
+    case T_LPCTYPE:
+        ref_lpctype(to->u.lpctype);
         break;
 
     case T_LVALUE:
@@ -1730,6 +1752,11 @@ internal_assign_svalue_no_free (svalue_t *to, svalue_t *from)
 
         } /* switch */
         break;
+
+#ifdef USE_PYTHON
+    case T_PYTHON:
+        ref_python_ob(to);
+#endif
     }
 
 } /* internal_assign_svalue_no_free() */
@@ -5157,7 +5184,7 @@ check_struct_op (svalue_t * sp, bytecode_p pc, bool * ignore_error)
  */
 
 {
-    short s_index;
+    unsigned short s_index;
     svalue_t * svp, * isvp;
 
     if (ignore_error)
@@ -5171,7 +5198,8 @@ check_struct_op (svalue_t * sp, bytecode_p pc, bool * ignore_error)
                , typename((isvp ? isvp : sp)->type)
               ));
     if (isvp->u.number >= 0
-     && isvp->u.number >= current_prog->num_structs)
+     && isvp->u.number >= current_prog->num_structs
+     && (isvp->u.number < STD_STRUCT_OFFSET || isvp->u.number >= USHRT_MAX))
     {
         ERRORF(("Too big struct index: %"PRIdPINT", max %hu\n"
                , isvp->u.number, current_prog->num_structs
@@ -5179,7 +5207,7 @@ check_struct_op (svalue_t * sp, bytecode_p pc, bool * ignore_error)
     }
 
     /* Get the struct type index */
-    s_index = (short)isvp->u.number;
+    s_index = (unsigned short)isvp->u.number;
 
     /* Get the struct value itself */
     svp = get_rvalue(sp-2, NULL);
@@ -5192,9 +5220,11 @@ check_struct_op (svalue_t * sp, bytecode_p pc, bool * ignore_error)
     }
 
     /* Check if the struct on the stack is of the correct type */
-    if (s_index >= 0)
+    if (s_index != USHRT_MAX)
     {
-        struct_type_t * pExpected = current_prog->struct_defs[s_index].type;
+        struct_type_t * pExpected = (s_index >= STD_STRUCT_OFFSET)
+                                  ? get_std_struct_type(s_index - STD_STRUCT_OFFSET)
+                                  : current_prog->struct_defs[s_index].type;
         struct_type_t * pType = svp->u.strct->type;
 
         if (struct_baseof(pExpected, pType))
@@ -7598,6 +7628,22 @@ const char * typename (int type) { return typename_inline(type); }
 
 /*-------------------------------------------------------------------------*/
 const char *
+sv_typename (svalue_t *val)
+
+/* Translate the type of svalue <val> into a readable string.
+ */
+
+{
+#ifdef USE_PYTHON
+    if (val->type == T_PYTHON)
+        return get_txt(get_python_type_name(val->x.python_type)->name);
+#endif
+
+    return typename(val->type);
+} /* sv_typename() */
+
+/*-------------------------------------------------------------------------*/
+const char *
 efun_arg_typename (long type)
 
 /* Translate the bit-encoded efun argument <type> into a readable
@@ -7713,15 +7759,15 @@ vefun_bad_arg (int arg, svalue_t *sp)
 
 /*-------------------------------------------------------------------------*/
 static INLINE void
-raise_arg_error (int instr, int arg, long expected, int got)
+raise_arg_error (int instr, int arg, long expected, svalue_t *got)
   NORETURN;
 
 static INLINE void
-raise_arg_error (int instr, int arg, long expected, int got)
+raise_arg_error (int instr, int arg, long expected, svalue_t *got)
 
 /* The argument <arg> to <instr> had the wrong type: expected was the
  * type <expected> (bit-encoded as in the efun_lpc_types[]), but
- * it got the type <got> (the svalue type tag).
+ * it got the svalue <got>.
  * If <instr> is negative, the instruction code is read from
  * inter_pc - <instr>; otherwise it is the instruction code itself.
  *
@@ -7739,16 +7785,16 @@ raise_arg_error (int instr, int arg, long expected, int got)
         expected = efun_lpc_types[instrs[instr].lpc_arg_index];
 
     errorf("Bad arg %d to %s(): got '%s', expected '%s'.\n"
-         , arg, get_f_name(instr), typename(got), efun_arg_typename(expected)
+         , arg, get_f_name(instr), sv_typename(got), efun_arg_typename(expected)
          );
     /* NOTREACHED */
 } /* raise_arg_error() */
 
 /*-------------------------------------------------------------------------*/
 void
-efun_gen_arg_error (int arg, int got, svalue_t *sp)
+efun_gen_arg_error (int arg, svalue_t *got, svalue_t *sp)
 
-/* The argument <arg> to the current tabled efun had the wrong type <got>.
+/* The argument <arg> to the current tabled efun had the wrong svalue <got>.
  * inter_pc is assumed to be correct, inter_sp will be set from <sp>.
  */
 
@@ -7760,9 +7806,9 @@ efun_gen_arg_error (int arg, int got, svalue_t *sp)
 
 /*-------------------------------------------------------------------------*/
 void
-vefun_gen_arg_error (int arg, int got, svalue_t *sp)
+vefun_gen_arg_error (int arg, svalue_t *got, svalue_t *sp)
 
-/* The argument <arg> to the current tabled vefun had the wrong type <got>.
+/* The argument <arg> to the current tabled vefun had the wrong svalue <got>.
  * inter_pc is assumed to be correct, inter_sp will be set from <sp>.
  */
 
@@ -7774,11 +7820,11 @@ vefun_gen_arg_error (int arg, int got, svalue_t *sp)
 
 /*-------------------------------------------------------------------------*/
 void
-efun_arg_error (int arg, int expected, int got, svalue_t *sp)
+efun_arg_error (int arg, int expected, svalue_t *got, svalue_t *sp)
 
 /* The argument <arg> to the current tabled efun had the wrong type:
- * expected was the type <expected>, but it got the type <got>
- * (both values are the svalue type tag).
+ * expected was the type <expected> (an svalue type tag), but it got
+ * the svalue <got>
  * inter_pc is assumed to be correct, inter_sp will be set from <sp>.
  */
 
@@ -7790,11 +7836,11 @@ efun_arg_error (int arg, int expected, int got, svalue_t *sp)
 
 /*-------------------------------------------------------------------------*/
 void
-efun_exp_arg_error (int arg, long expected, int got, svalue_t *sp)
+efun_exp_arg_error (int arg, long expected, svalue_t *got, svalue_t *sp)
 
 /* The argument <arg> to the current tabled efun had the wrong type:
- * expected was the type <expected> (given as bitflags), but it got the type
- * <got> (given as svalue type tag).
+ * expected was the type <expected> (given as bitflags), but it got the
+ * svalue <got>.
  * inter_pc is assumed to be correct, inter_sp will be set from <sp>.
  */
 
@@ -7806,11 +7852,11 @@ efun_exp_arg_error (int arg, long expected, int got, svalue_t *sp)
 
 /*-------------------------------------------------------------------------*/
 void
-vefun_arg_error (int arg, int expected, int got, svalue_t *sp)
+vefun_arg_error (int arg, int expected, svalue_t *got, svalue_t *sp)
 
 /* The argument <arg> to the current tabled vefun had the wrong type:
- * expected was the type <expected>, but it got the type <got>
- * (both values are the svalue type tag).
+ * expected was the type <expected> (an svalue type tag), but it got
+ * the svalue <got>.
  * inter_pc is assumed to be correct, inter_sp will be set from <sp>.
  */
 
@@ -7822,11 +7868,11 @@ vefun_arg_error (int arg, int expected, int got, svalue_t *sp)
 
 /*-------------------------------------------------------------------------*/
 void
-vefun_exp_arg_error (int arg, long expected, int got, svalue_t *sp)
+vefun_exp_arg_error (int arg, long expected, svalue_t *got, svalue_t *sp)
 
 /* The argument <arg> to the current tabled vefun had the wrong type:
  * expected was the type <expected> (in the bit-encoded format), but
- * it got the type <got> (the svalue type tag).
+ * it got the svalue <got>.
  * inter_pc is assumed to be correct, inter_sp will be set from <sp>.
  */
 
@@ -7838,15 +7884,15 @@ vefun_exp_arg_error (int arg, long expected, int got, svalue_t *sp)
 
 /*-------------------------------------------------------------------------*/
 static INLINE void
-code_exp_arg_error (int arg, long expected, int got, bytecode_p pc, svalue_t *sp)
+code_exp_arg_error (int arg, long expected, svalue_t *got, bytecode_p pc, svalue_t *sp)
   NORETURN;
 
 static INLINE void
-code_exp_arg_error (int arg, long expected, int got, bytecode_p pc, svalue_t *sp)
+code_exp_arg_error (int arg, long expected, svalue_t *got, bytecode_p pc, svalue_t *sp)
 
 /* The argument <arg> to the current one-byte instruction had the wrong type:
  * expected was the type <expected> (in bit-flag encoding), but it got the
- * type <got> (the svalue type tag).
+ * svalue <got>.
  * inter_pc will be set from <pc>, inter_sp will be set from <sp>.
  */
 
@@ -7859,22 +7905,22 @@ code_exp_arg_error (int arg, long expected, int got, bytecode_p pc, svalue_t *sp
     instr = complete_instruction(-1);
 
     errorf("Bad arg %d to %s: got '%s', expected '%s'.\n"
-         , arg, get_f_name(instr), typename(got), efun_arg_typename(expected)
+         , arg, get_f_name(instr), sv_typename(got), efun_arg_typename(expected)
          );
     /* NOTREACHED */
 } /* code_exp_arg_error() */
 
 /*-------------------------------------------------------------------------*/
 static INLINE void
-code_arg_error (int arg, int expected, int got, bytecode_p pc, svalue_t *sp)
+code_arg_error (int arg, int expected, svalue_t *got, bytecode_p pc, svalue_t *sp)
   NORETURN;
 
 static INLINE void
-code_arg_error (int arg, int expected, int got, bytecode_p pc, svalue_t *sp)
+code_arg_error (int arg, int expected, svalue_t *got, bytecode_p pc, svalue_t *sp)
 
 /* The argument <arg> to the current one-byte instruction had the wrong type:
- * expected was the type <expected>, but it got the type <got>
- * (both values are the svalue type tag).
+ * expected was the type <expected> (an svalue type tag), but it got the
+ * svalue <got>.
  * inter_pc will be set from <pc>, inter_sp will be set from <sp>.
  */
 
@@ -7885,15 +7931,15 @@ code_arg_error (int arg, int expected, int got, bytecode_p pc, svalue_t *sp)
 
 /*-------------------------------------------------------------------------*/
 static INLINE void
-op_exp_arg_error (int arg, long expected, int got, bytecode_p pc, svalue_t *sp)
+op_exp_arg_error (int arg, long expected, svalue_t *got, bytecode_p pc, svalue_t *sp)
   NORETURN;
 
 static INLINE void
-op_exp_arg_error (int arg, long expected, int got, bytecode_p pc, svalue_t *sp)
+op_exp_arg_error (int arg, long expected, svalue_t *got, bytecode_p pc, svalue_t *sp)
 
 /* The argument <arg> to the current one-byte operator had the wrong type:
  * expected was the type <expected> (bit-encoded as in efun_lpc_types[]),
- * but it got the type <got> (the svalue type tag).
+ * but it got the svalue <got>.
  * inter_pc will be set from <pc>, inter_sp will be set from <sp>.
  *
  * This function is to be used with binary operators like + or *; the
@@ -7910,22 +7956,22 @@ op_exp_arg_error (int arg, long expected, int got, bytecode_p pc, svalue_t *sp)
 
     errorf("Bad %s arg to %s: got '%s', expected '%s'.\n"
          , arg == 1 ? "left" : "right"
-         , get_f_name(instr), typename(got), efun_arg_typename(expected)
+         , get_f_name(instr), sv_typename(got), efun_arg_typename(expected)
          );
     /* NOTREACHED */
 } /* op_exp_arg_error() */
 
 /*-------------------------------------------------------------------------*/
 static INLINE void
-op_arg_error (int arg, int expected, int got, bytecode_p pc, svalue_t *sp)
+op_arg_error (int arg, int expected, svalue_t *got, bytecode_p pc, svalue_t *sp)
   NORETURN;
 
 static INLINE void
-op_arg_error (int arg, int expected, int got, bytecode_p pc, svalue_t *sp)
+op_arg_error (int arg, int expected, svalue_t *got, bytecode_p pc, svalue_t *sp)
 
 /* The argument <arg> to the current one-byte operator had the wrong type:
- * expected was the type <expected>, but it got the type <got>
- * (both values are the svalue type tag).
+ * expected was the type <expected> (an svalue type tag), but it got the
+ * svalue <got>.
  * inter_pc will be set from <pc>, inter_sp will be set from <sp>.
  *
  * This function is to be used with binary operators like + or *; the
@@ -7966,7 +8012,7 @@ test_efun_args (int instr, int args, svalue_t *argp)
             continue;
 
         if (!(exp_type & (1 << act_type)))
-            raise_arg_error(instr, i, exp_type, act_type);
+            raise_arg_error(instr, i, exp_type, argp);
     }
 } /* test_efun_args() */
 
@@ -8165,6 +8211,16 @@ check_rtt_compatibility_inl(lpctype_t *formaltype, svalue_t *svp, lpctype_t **sv
         case T_STRUCT:
             valuetype = get_struct_type(bsvp->u.strct->type);
             break;
+
+        case T_LPCTYPE:
+            valuetype = lpctype_lpctype;
+            break;
+
+#ifdef USE_PYTHON
+        case T_PYTHON:
+            valuetype = get_python_type(bsvp->x.python_type);
+            break;
+#endif
     }
 
     if (valuetype)
@@ -8255,7 +8311,7 @@ check_function_args(int fx, program_t *progp, bytecode_p funstart)
         && progp->type_start && progp->type_start[fx] != INDEX_START_NONE)
     {
         // check for the correct argument types
-        lpctype_t **arg_type = progp->argument_types + progp->type_start[fx];
+        unsigned short *arg_type_idx = progp->argument_types + progp->type_start[fx];
         svalue_t *firstarg = inter_sp - csp->num_local_variables + 1;
         function_t *header = current_prog->function_headers + FUNCTION_HEADER_INDEX(funstart);
 
@@ -8263,16 +8319,17 @@ check_function_args(int fx, program_t *progp, bytecode_p funstart)
         int i = 0;
         while (i < formal_args)
         {
+            lpctype_t *arg_type = progp->types[arg_type_idx[i]];
             // do the types match (in case of structs also the structure)
             // or is the formal argument of type TYPE_ANY (mixed)?
-            if (!check_rtt_compatibility(arg_type[i], firstarg+i))
+            if (!check_rtt_compatibility(arg_type, firstarg+i))
             {
                 // How many control stack frames to remove.
                 int num_csf = 0;
 
-                // Determine the lpctype of arg_type[i] for a better error message.
+                // Determine the lpctype of arg[i] for a better error message.
                 static char buff[512];
-                lpctype_t *realtype = get_rtt_type(arg_type[i], firstarg+i);
+                lpctype_t *realtype = get_rtt_type(arg_type, firstarg+i);
                 get_lpctype_name_buf(realtype, buff, sizeof(buff));
                 free_lpctype(realtype);
 
@@ -8328,7 +8385,7 @@ check_function_args(int fx, program_t *progp, bytecode_p funstart)
                     // warnf will return (errors are caught).
                     warnf("Bad arg %d to %s(): got '%s', expected '%s'.\n"
                            , i+1, get_txt(header->name), buff,
-                           get_lpctype_name(arg_type[i]));
+                           get_lpctype_name(arg_type));
 
                     for (int j = num_csf; j >= 0; j--)
                         *(++csp) = saved_csf[j];
@@ -8342,7 +8399,7 @@ check_function_args(int fx, program_t *progp, bytecode_p funstart)
 
                     errorf("Bad arg %d to %s(): got '%s', expected '%s'.\n"
                            , i+1, get_txt(header->name), buff,
-                           get_lpctype_name(arg_type[i]));
+                           get_lpctype_name(arg_type));
                 }
             }
             ++i;
@@ -8706,12 +8763,14 @@ do_trace_call (bytecode_p funstart, Bool is_lambda)
         /* Trace the function itself */
         if (is_lambda)
         {
-            lambda_t *l = current_lambda.u.lambda;
+            lambda_t *l;
             if (current_lambda.x.closure_type == CLOSURE_BOUND_LAMBDA)
-                l = l->function.lambda;
+                l = current_lambda.u.bound_lambda->lambda;
+            else
+                l = current_lambda.u.lambda;
 
             do_trace("Call direct ", "lambda-closure", " ");
-            num_args = l->function.code.num_arg;
+            num_args = l->num_arg;
         }
         else
         {
@@ -9265,6 +9324,7 @@ setup_new_frame2 (bytecode_p funstart, svalue_t *sp
                    */
     int num_arg;  /* Number of formal args */
     int num_vars; /* Number of local variables */
+    int num_opt_arg;  /* Number of optional formal arguments */
     bool has_varargs; /* Function has an varargs parameter. */
 
     /* Setup the frame pointer */
@@ -9276,20 +9336,21 @@ setup_new_frame2 (bytecode_p funstart, svalue_t *sp
     /* (Re)move excessive arguments.  */
     if (is_lambda)
     {
-        lambda_t *l = current_lambda.u.lambda;
+        lambda_t *l;
         if (current_lambda.x.closure_type == CLOSURE_BOUND_LAMBDA)
-            l = l->function.lambda;
+            l = current_lambda.u.bound_lambda->lambda;
+        else
+            l = current_lambda.u.lambda;
 
-        num_arg = l->function.code.num_arg;
-        num_vars = l->function.code.num_locals;
-        has_varargs = false;
+        num_arg = l->num_arg;
+        num_opt_arg = l->num_opt_arg;
+        num_vars = l->num_locals;
+        has_varargs = l->xvarargs;
 
         inter_pc = funstart;
     }
     else
     {
-        int num_opt_arg; /* Number of optional formal arguments */
-
         function_t *header = current_prog->function_headers + FUNCTION_HEADER_INDEX(funstart);
         num_arg = header->num_arg;
         num_opt_arg = header->num_opt_arg;
@@ -9297,24 +9358,25 @@ setup_new_frame2 (bytecode_p funstart, svalue_t *sp
         has_varargs = (header->flags & TYPE_MOD_XVARARGS) != 0;
 
         inter_pc = funstart;
-        if (num_opt_arg)
-        {
-            /* Modify inter_pc, depending on how many
-             * arguments are missing. */
-            int missing = num_arg - csp->num_local_variables;
+    }
 
-            if (has_varargs)
-                missing--;
-            if (missing < 0)
-                missing = 0;
-            else if (missing > num_opt_arg)
-                missing = num_opt_arg;
+    if (num_opt_arg)
+    {
+        /* Modify inter_pc, depending on how many
+         * arguments are missing. */
+        int missing = num_arg - csp->num_local_variables;
 
-            /* Skip the initial jump table. */
-            inter_pc += num_opt_arg * sizeof(unsigned short);
-            if (missing < num_opt_arg)
-                inter_pc += get_short(funstart + sizeof(unsigned short) * (num_opt_arg - missing - 1));
-        }
+        if (has_varargs)
+            missing--;
+        if (missing < 0)
+            missing = 0;
+        else if (missing > num_opt_arg)
+            missing = num_opt_arg;
+
+        /* Skip the initial jump table. */
+        inter_pc += num_opt_arg * sizeof(unsigned short);
+        if (missing < num_opt_arg)
+            inter_pc += get_short(funstart + sizeof(unsigned short) * (num_opt_arg - missing - 1));
     }
 
     if (has_varargs)
@@ -9869,6 +9931,8 @@ eval_instruction (bytecode_p first_instruction
      *                It is either the left or the right argument to a
      *                one-byte operator.
      *
+     *   CALL_PYTHON_TYPE_EFUN(code, num_arg): if there is a Python
+     *                efun override for the argument, call it.
      */
 
 #   ifdef DEBUG
@@ -9912,11 +9976,11 @@ eval_instruction (bytecode_p first_instruction
        OP_ARG_ERROR_TEMPL(op_exp_arg_error, arg, expected, got)
 
 #   define TYPE_TEST_TEMPL(num, arg, t) \
-        if ( (arg)->type != t ) code_arg_error(num, t, (arg)->type, pc, sp); else NOOP;
+        if ( (arg)->type != t ) code_arg_error(num, t, arg, pc, sp); else NOOP;
 #   define OP_TYPE_TEST_TEMPL(num, arg, t) \
-        if ( (arg)->type != t ) op_arg_error(num, t, (arg)->type, pc, sp); else NOOP;
+        if ( (arg)->type != t ) op_arg_error(num, t, arg, pc, sp); else NOOP;
 #   define EXP_TYPE_TEST_TEMPL(num, arg, t) \
-        if (!( (1 << (arg)->type) & (t)) ) op_exp_arg_error(num, (t), (arg)->type, pc, sp); else NOOP;
+        if (!( (1 << (arg)->type) & (t)) ) op_exp_arg_error(num, (t), arg, pc, sp); else NOOP;
 
 #   define TYPE_TEST1(arg, t) TYPE_TEST_TEMPL(1, arg, t)
 #   define TYPE_TEST2(arg, t) TYPE_TEST_TEMPL(2, arg, t)
@@ -9930,6 +9994,18 @@ eval_instruction (bytecode_p first_instruction
 #   define TYPE_TEST_EXP_RIGHT(arg, t) EXP_TYPE_TEST_TEMPL(2, arg, t)
       /* Test the type of a certain argument.
        */
+
+#ifdef USE_PYTHON
+#   define CALL_PYTHON_TYPE_EFUN(code, num_arg) \
+        svalue_t *python_result = call_python_type_efun(sp, code, num_arg); \
+        if (python_result) \
+        { \
+            sp = python_result; \
+            break; \
+        }
+#else
+#   define CALL_PYTHON_TYPE_EFUN(code, num_arg) NOOP
+#endif
 
 #   ifdef MARK
 #        define CASE(x) case (x): MARK(x);
@@ -9966,6 +10042,8 @@ eval_instruction (bytecode_p first_instruction
         sp = restore_argument_frames(sp-1, &ap)+1;
         if (sp < inter_sp)
             *sp = *inter_sp;
+
+        tracedepth++;
     }
     SET_TRACE_EXEC();
 
@@ -10280,6 +10358,7 @@ again:
             errorf("%s() from lightweight object.\n", instrs[instruction].name);
 
         assign_eval_cost_inl();
+        CALL_PYTHON_TYPE_EFUN(instruction, 1);
         test_efun_args(instruction, 1, sp);
         sp = (*efun_table[instruction-TEFUN_OFFSET])(sp);
 #ifdef CHECK_OBJECT_REF
@@ -10334,6 +10413,7 @@ again:
             errorf("%s() from lightweight object.\n", instrs[instruction].name);
 
         assign_eval_cost_inl();
+        CALL_PYTHON_TYPE_EFUN(instruction, 2);
         test_efun_args(instruction, 2, sp-1);
         sp = (*efun_table[instruction-TEFUN_OFFSET])(sp);
 #ifdef CHECK_OBJECT_REF
@@ -10389,6 +10469,7 @@ again:
             errorf("%s() from lightweight object.\n", instrs[instruction].name);
 
         assign_eval_cost_inl();
+        CALL_PYTHON_TYPE_EFUN(instruction, 3);
         test_efun_args(instruction, 3, sp-2);
         sp = (*efun_table[instruction-TEFUN_OFFSET])(sp);
 #ifdef CHECK_OBJECT_REF
@@ -10443,6 +10524,7 @@ again:
             errorf("%s() from lightweight object.\n", instrs[instruction].name);
 
         assign_eval_cost_inl();
+        CALL_PYTHON_TYPE_EFUN(instruction, 4);
         test_efun_args(instruction, 4, sp-3);
         sp = (*efun_table[instruction-TEFUN_OFFSET])(sp);
 #ifdef CHECK_OBJECT_REF
@@ -10493,6 +10575,8 @@ again:
         if (max_arg >= 0 && numarg > max_arg)
             ERRORF(("Too many args for %s: got %d, expected %d.\n"
                    , instrs[instruction].name, numarg, max_arg));
+
+        CALL_PYTHON_TYPE_EFUN(instruction, numarg);
 
         test_efun_args(instruction, numarg, sp-numarg+1);
         sp = (*vefun_table[instruction-EFUNV_OFFSET])(sp, numarg);
@@ -10731,7 +10815,7 @@ again:
             if (explicit_context_size != 0)
             {
                 unsigned short i;
-                svalue_t * context = sp->u.lambda->context;
+                svalue_t * context = sp->u.lfun_closure->context;
 
                 for (i = 0; i < explicit_context_size; i++)
                 {
@@ -10748,7 +10832,7 @@ again:
             {
                 unsigned short i;
                 svalue_t * arg = sp - implicit_context_size;
-                svalue_t * context = sp->u.lambda->context + explicit_context_size;
+                svalue_t * context = sp->u.lfun_closure->context + explicit_context_size;
 
                 for (i = 0; i < implicit_context_size; i++)
                     transfer_svalue_no_free(context+i, arg+i);
@@ -10807,6 +10891,90 @@ again:
                 }
             }
         }
+        break;
+    }
+
+    CASE(F_CONTEXT_LAMBDA); /* --- context_lambda <lix> <lsize> <vix> <num_ex> <num_im> --- */
+    {
+        /* Create a copy of a lambda closure and put context values into it.
+         * The lambda to be copied is the value at index <lix> of the current
+         * lambda closure. It's code size is <lsize>. The context consists of
+         * <num_ex> explicit values (to be taken from the local variables
+         * at <vix>) and <num_in> implicit values on the stack.
+         */
+
+        uint16_t lambda_index = load_uint16(&pc);
+        uint32_t code_size = load_uint32(&pc);
+        svalue_t * explicit_context = fp + load_uint8(&pc);
+        uint16_t explicit_context_size = load_uint16(&pc);
+        uint16_t implicit_context_size = load_uint16(&pc);
+
+        lambda_t *orig, *l;
+        void *block;
+        svalue_t *values, *orig_svp, *orig_values;
+        size_t lambda_size, value_size;
+
+        /* Get the original lambda from the current lambda. */
+        orig_svp = (svalue_t *)((void *)(csp->funstart) - LAMBDA_VALUE_OFFSET) - lambda_index;
+        assert(orig_svp->type == T_CLOSURE);
+        assert(orig_svp->x.closure_type == CLOSURE_LAMBDA);
+        orig = orig_svp->u.lambda;
+
+        /* Create the new lambda closure. */
+        lambda_size = sizeof(lambda_t) + code_size;
+        value_size = orig->num_values * sizeof(svalue_t);
+
+        if ( !(block = xalloc(lambda_size + value_size)) )
+        {
+            ERRORF(("Out of memory: closure structure (%zd bytes)", lambda_size + value_size));
+            break;
+        }
+
+        /* Copy header and code. */
+        l =  (lambda_t*)(block + value_size);
+        memcpy(l, orig, lambda_size);
+        l->base.prog_ob = ref_valid_object(orig->base.prog_ob, "context_lambda");
+        assign_object_svalue_no_free(&l->base.ob, orig->base.ob, "context_lambda");
+
+        /* Copy context values. */
+        assert(implicit_context_size + explicit_context_size <= l->num_values);
+
+        values = (svalue_t*) block;
+
+        /* Now copy the context values */
+        if (explicit_context_size != 0)
+        {
+            for (uint16_t i = 0; i < explicit_context_size; i++)
+            {
+                transfer_svalue_no_free(values++, explicit_context+i);
+
+                /* Set it to T_INVALID, as it is still a variable of
+                 * the function frame and will be freed on return.
+                 */
+                explicit_context[i].type = T_INVALID;
+            }
+        }
+
+        if (implicit_context_size != 0)
+        {
+            svalue_t * arg = sp - implicit_context_size + 1;
+
+            for (uint16_t i = 0; i < implicit_context_size; i++)
+                transfer_svalue_no_free(values++, arg+i);
+
+            sp -= implicit_context_size;
+        }
+
+        /* Copy the remaining values from the lambda closure. */
+        orig_values = (svalue_t*)(((void*)orig) - ((void*)l) + ((void*)values));
+        while (values != (void*)l)
+            assign_svalue_no_free(values++, orig_values++);
+
+        sp++;
+        sp->type = T_CLOSURE;
+        sp->x.closure_type = CLOSURE_LAMBDA;
+        sp->u.lambda = l;
+
         break;
     }
 
@@ -10931,6 +11099,9 @@ again:
             }
         }
 
+        if (csp->extern_call)
+            assign_eval_cost_inl();
+
         if (current_coroutine)
         {
             /* Is there some coroutine waiting? Then continue there. */
@@ -10962,6 +11133,8 @@ again:
                 *(++sp) = value;
                 break;
             }
+
+            /* At this point, current_object might not be valid anymore. */
         }
 
         /* Restore the previous execution context */
@@ -10969,8 +11142,6 @@ again:
         if (extern_call)
         {
             /* eval_instruction() must be left - setup the globals */
-            assign_eval_cost_inl();
-
             current_object = csp->ob;
             previous_ob = csp->prev_ob;
         }
@@ -11223,7 +11394,7 @@ again:
 
         tracedepth--; /* We leave this level */
         if (trace_level)
-            do_trace_return(sp);
+            do_trace_return(inter_sp);
 
         pop_control_stack();
 
@@ -11864,6 +12035,9 @@ again:
          * If CATCH_FLAG_RESERVE is set, the top most stack value denotes
          * the eval cost to reserve for the catch handling - it is removed
          * from the stack before continuing.
+         * If CATCH_FLAG_LIMIT is set, the (next) top most stack value
+         * contains the eval limit for the expression - it is also removed
+         * from the stack.
          *
          * The implementation is such that a control-stack entry is created
          * as if the instructions following catch are called as a subroutine
@@ -11886,6 +12060,7 @@ again:
         uint offset;
         int  flags;
         int32 reserve_cost = CATCH_RESERVED_COST;
+        int32 cost_limit = -1;
 
         /* Get the flags */
         flags = LOAD_UINT8(pc);
@@ -11910,6 +12085,28 @@ again:
             reserve_cost = sp->u.number;
             sp--;
         }
+
+        if (flags & CATCH_FLAG_LIMIT)
+        {
+            if (sp->type != T_NUMBER)
+            {
+                ERRORF(("Illegal 'limit' type for catch(): got %s, expected number.\n"
+                       , typename(sp->type)
+                       ));
+            }
+
+            if (sp->u.number <= 0)
+            {
+                ERRORF(("Illegal 'limit' value for catch(): got %"PRIdPINT
+                        ", expected a positive value.\n"
+                       , sp->u.number
+                       ));
+            }
+
+            cost_limit = sp->u.number;
+            sp--;
+        }
+
         /* Get the offset to the next instruction after the CATCH statement.
          */
         offset = LOAD_UINT8(pc);
@@ -11928,6 +12125,7 @@ again:
 #endif
                               , inter_pc, inter_fp
                               , reserve_cost
+                              , cost_limit
                               , inter_context
                               )
            )
@@ -12164,6 +12362,13 @@ again:
          *   vector      + vector             -> vector
          *   mapping     + mapping            -> mapping
          */
+#ifdef USE_PYTHON
+        if (sp[0].type == T_PYTHON || sp[-1].type == T_PYTHON)
+        {
+            sp = do_python_binary_operation(sp, PYTHON_OP_ADD, PYTHON_OP_RADD, "+");
+            break;
+        }
+#endif
 
         switch ( sp[-1].type )
         {
@@ -12245,7 +12450,7 @@ again:
               }
 
             default:
-                OP_ARG_ERROR(2, TF_STRING|TF_FLOAT|TF_NUMBER, sp->type);
+                OP_ARG_ERROR(2, TF_STRING|TF_FLOAT|TF_NUMBER, sp);
                 /* NOTREACHED */
             }
             break;
@@ -12314,7 +12519,7 @@ again:
               }
 
             default:
-                OP_ARG_ERROR(2, TF_STRING|TF_FLOAT|TF_NUMBER, sp->type);
+                OP_ARG_ERROR(2, TF_STRING|TF_FLOAT|TF_NUMBER, sp);
                 /* NOTREACHED */
             }
             break;
@@ -12367,7 +12572,7 @@ again:
                 put_string(sp, res);
                 break;
             }
-            OP_ARG_ERROR(2, TF_STRING|TF_FLOAT|TF_NUMBER, sp->type);
+            OP_ARG_ERROR(2, TF_STRING|TF_FLOAT|TF_NUMBER, sp);
             /* NOTREACHED */
           }
           /* End of case T_FLOAT */
@@ -12417,7 +12622,7 @@ again:
 
         default:
             OP_ARG_ERROR(1, TF_POINTER|TF_MAPPING|TF_STRING|TF_BYTES|TF_FLOAT|TF_NUMBER
-                          , sp[-1].type);
+                          , sp-1);
             /* NOTREACHED */
         }
 
@@ -12441,6 +12646,14 @@ again:
          */
 
         p_int i;
+
+#ifdef USE_PYTHON
+        if (sp[0].type == T_PYTHON || sp[-1].type == T_PYTHON)
+        {
+            sp = do_python_binary_operation(sp, PYTHON_OP_SUB, PYTHON_OP_RSUB, "-");
+            break;
+        }
+#endif
 
         if ((sp-1)->type == T_NUMBER)
         {
@@ -12478,7 +12691,7 @@ again:
                 sp->type = T_FLOAT;
                 break;
             }
-            OP_ARG_ERROR(2, TF_FLOAT|TF_NUMBER, sp->type);
+            OP_ARG_ERROR(2, TF_FLOAT|TF_NUMBER, sp);
             /* NOTREACHED */
         }
         else if ((sp-1)->type == T_FLOAT)
@@ -12506,7 +12719,7 @@ again:
                 STORE_DOUBLE(sp, diff);
                 break;
             }
-            OP_ARG_ERROR(2, TF_FLOAT|TF_NUMBER, sp->type);
+            OP_ARG_ERROR(2, TF_FLOAT|TF_NUMBER, sp);
             /* NOTREACHED */
         }
         else if ((sp-1)->type == T_POINTER)
@@ -12530,7 +12743,7 @@ again:
                 sp--;
                 break;
             }
-            OP_ARG_ERROR(2, TF_POINTER|TF_MAPPING, sp->type);
+            OP_ARG_ERROR(2, TF_POINTER|TF_MAPPING, sp);
             /* NOTREACHED */
         }
         else if ((sp-1)->type == T_MAPPING)
@@ -12556,7 +12769,7 @@ again:
                 sp->u.map = m;
                 break;
             }
-            OP_ARG_ERROR(2, TF_POINTER|TF_MAPPING, sp->type);
+            OP_ARG_ERROR(2, TF_POINTER|TF_MAPPING, sp);
         }
         else if ((sp-1)->type == T_STRING || (sp-1)->type == T_BYTES)
         {
@@ -12574,7 +12787,7 @@ again:
         }
 
         OP_ARG_ERROR(1, TF_POINTER|TF_MAPPING|TF_STRING|TF_BYTES|TF_FLOAT|TF_NUMBER
-                      , sp[-1].type);
+                      , sp-1);
         /* NOTREACHED */
     }
 
@@ -12598,6 +12811,14 @@ again:
          */
 
         p_int i;
+
+#ifdef USE_PYTHON
+        if (sp[0].type == T_PYTHON || sp[-1].type == T_PYTHON)
+        {
+            sp = do_python_binary_operation(sp, PYTHON_OP_MUL, PYTHON_OP_RMUL, "*");
+            break;
+        }
+#endif
 
         switch ( sp[-1].type )
         {
@@ -12744,7 +12965,7 @@ again:
                 break;
             }
             OP_ARG_ERROR(2, TF_POINTER|TF_STRING|TF_BYTES|TF_FLOAT|TF_NUMBER
-                          , sp->type);
+                          , sp);
             /* NOTREACHED */
         case T_FLOAT:
           {
@@ -12771,7 +12992,7 @@ again:
                 sp--;
                 break;
             }
-            OP_ARG_ERROR(2, TF_FLOAT|TF_NUMBER, sp->type);
+            OP_ARG_ERROR(2, TF_FLOAT|TF_NUMBER, sp);
             /* NOTREACHED */
           }
         case T_STRING:
@@ -12808,7 +13029,7 @@ again:
                 sp->u.str = result;
                 break;
             }
-            BAD_OP_ARG(2, T_NUMBER, sp->type);
+            BAD_OP_ARG(2, T_NUMBER, sp);
             /* NOTREACHED */
           }
         case T_POINTER:
@@ -12858,12 +13079,12 @@ again:
                 put_array(sp, result);
                 break;
               }
-            BAD_OP_ARG(2, T_NUMBER, sp->type);
+            BAD_OP_ARG(2, T_NUMBER, sp);
             /* NOTREACHED */
           }
         default:
             OP_ARG_ERROR(1, TF_POINTER|TF_STRING|TF_BYTES|TF_FLOAT|TF_NUMBER
-                          , sp[-1].type);
+                          , sp-1);
             /* NOTREACHED */
         }
         break;
@@ -12883,6 +13104,14 @@ again:
          */
 
         p_int i;
+
+#ifdef USE_PYTHON
+        if (sp[0].type == T_PYTHON || sp[-1].type == T_PYTHON)
+        {
+            sp = do_python_binary_operation(sp, PYTHON_OP_DIV, PYTHON_OP_RDIV, "/");
+            break;
+        }
+#endif
 
         if ((sp-1)->type == T_NUMBER)
         {
@@ -12915,7 +13144,7 @@ again:
                 sp->type = T_FLOAT;
                 break;
             }
-            OP_ARG_ERROR(2, TF_FLOAT|TF_NUMBER, sp->type);
+            OP_ARG_ERROR(2, TF_FLOAT|TF_NUMBER, sp);
             /* NOTREACHED */
         }
         else if ((sp-1)->type == T_FLOAT)
@@ -12953,10 +13182,10 @@ again:
                 STORE_DOUBLE(sp, dtmp);
                 break;
             }
-            OP_ARG_ERROR(2, TF_FLOAT|TF_NUMBER, sp->type);
+            OP_ARG_ERROR(2, TF_FLOAT|TF_NUMBER, sp);
             /* NOTREACHED */
         }
-        OP_ARG_ERROR(1, TF_FLOAT|TF_NUMBER, sp[-1].type);
+        OP_ARG_ERROR(1, TF_FLOAT|TF_NUMBER, sp-1);
         /* NOTREACHED */
         break;
     }
@@ -12973,6 +13202,14 @@ again:
          */
 
         p_int i;
+
+#ifdef USE_PYTHON
+        if (sp[0].type == T_PYTHON || sp[-1].type == T_PYTHON)
+        {
+            sp = do_python_binary_operation(sp, PYTHON_OP_MOD, PYTHON_OP_RMOD, "%");
+            break;
+        }
+#endif
 
         TYPE_TEST_LEFT((sp-1), T_NUMBER);
         TYPE_TEST_RIGHT(sp, T_NUMBER);
@@ -12998,6 +13235,14 @@ again:
          */
 
         int i;
+
+#ifdef USE_PYTHON
+        if (sp[0].type == T_PYTHON || sp[-1].type == T_PYTHON)
+        {
+            sp = do_python_binary_operation(sp, PYTHON_OP_GT, PYTHON_OP_RGT, ">");
+            break;
+        }
+#endif
 
         if (((sp-1)->type == T_STRING && sp->type == T_STRING)
          || ((sp-1)->type == T_BYTES  && sp->type == T_BYTES))
@@ -13060,6 +13305,14 @@ again:
 
         int i;
 
+#ifdef USE_PYTHON
+        if (sp[0].type == T_PYTHON || sp[-1].type == T_PYTHON)
+        {
+            sp = do_python_binary_operation(sp, PYTHON_OP_GE, PYTHON_OP_RGE, ">=");
+            break;
+        }
+#endif
+
         if (((sp-1)->type == T_STRING && sp->type == T_STRING)
          || ((sp-1)->type == T_BYTES  && sp->type == T_BYTES))
         {
@@ -13121,6 +13374,14 @@ again:
 
         int i;
 
+#ifdef USE_PYTHON
+        if (sp[0].type == T_PYTHON || sp[-1].type == T_PYTHON)
+        {
+            sp = do_python_binary_operation(sp, PYTHON_OP_LT, PYTHON_OP_RLT, "<");
+            break;
+        }
+#endif
+
         if (((sp-1)->type == T_STRING && sp->type == T_STRING)
          || ((sp-1)->type == T_BYTES  && sp->type == T_BYTES))
         {
@@ -13181,6 +13442,14 @@ again:
          */
 
         int i;
+
+#ifdef USE_PYTHON
+        if (sp[0].type == T_PYTHON || sp[-1].type == T_PYTHON)
+        {
+            sp = do_python_binary_operation(sp, PYTHON_OP_LE, PYTHON_OP_RLE, "<=");
+            break;
+        }
+#endif
 
         if (((sp-1)->type == T_STRING && sp->type == T_STRING)
          || ((sp-1)->type == T_BYTES  && sp->type == T_BYTES))
@@ -13245,6 +13514,14 @@ again:
 
         int i = 0;
 
+#ifdef USE_PYTHON
+        if (sp[0].type == T_PYTHON || sp[-1].type == T_PYTHON)
+        {
+            sp = do_python_binary_operation(sp, PYTHON_OP_EQ, PYTHON_OP_REQ, "==");
+            break;
+        }
+#endif
+
         if ((sp-1)->type == T_NUMBER && sp->type == T_FLOAT)
         {
             i = (double)((sp-1)->u.number) == READ_DOUBLE( sp );
@@ -13306,6 +13583,17 @@ again:
             case T_MAPPING:
                 i = (sp-1)->u.map == sp->u.map;
                 break;
+
+            case T_LPCTYPE:
+                i = (sp-1)->u.lpctype == sp->u.lpctype;
+                break;
+
+#ifdef USE_PYTHON
+            case T_PYTHON:
+                i = (sp-1)->u.generic == sp->u.generic;
+                break;
+#endif
+
             default:
                 if (sp->type == T_LVALUE)
                     errorf("Reference passed to ==\n");
@@ -13333,6 +13621,14 @@ again:
          */
 
         int i = 0;
+
+#ifdef USE_PYTHON
+        if (sp[0].type == T_PYTHON || sp[-1].type == T_PYTHON)
+        {
+            sp = do_python_binary_operation(sp, PYTHON_OP_NE, PYTHON_OP_RNE, "!=");
+            break;
+        }
+#endif
 
         if ((sp-1)->type == T_NUMBER && sp->type == T_FLOAT)
         {
@@ -13389,6 +13685,17 @@ again:
             case T_MAPPING:
                 i = (sp-1)->u.map != sp->u.map;
                 break;
+
+            case T_LPCTYPE:
+                i = (sp-1)->u.lpctype != sp->u.lpctype;
+                break;
+
+#ifdef USE_PYTHON
+            case T_PYTHON:
+                i = (sp-1)->u.generic != sp->u.generic;
+                break;
+#endif
+
             default:
                 if (sp->type == T_LVALUE)
                     errorf("Reference passed to !=\n");
@@ -13434,7 +13741,7 @@ again:
 
                 for (svalue_t *entry = container->u.vec->item + start; count != 0; entry++, count--)
                 {
-                    if (rvalue_eq(item, entry) == 0)
+                    if (rvalue_eq(item, entry))
                     {
                         result = 1;
                         break;
@@ -13505,13 +13812,25 @@ again:
                         }
                         /* else FALLTHROUGH */
                     default:
-                        OP_ARG_ERROR(1, TF_NUMBER|(container->type == T_STRING ? TF_STRING : TF_BYTES), item->type);
+                        OP_ARG_ERROR(1, TF_NUMBER|(container->type == T_STRING ? TF_STRING : TF_BYTES), item);
                 }
                 break;
             }
 
+            case T_LPCTYPE:
+                if (item->type == T_LPCTYPE)
+                {
+                    if (item->u.lpctype == lpctype_void)
+                        result = 1;
+                    else
+                        result = lpctype_contains(item->u.lpctype, container->u.lpctype) ? 1 : 0;
+                }
+                else
+                    OP_ARG_ERROR(1, TF_LPCTYPE, item);
+                break;
+
             default:
-                OP_ARG_ERROR(2, TF_POINTER|TF_MAPPING|TF_STRING|TF_BYTES, sp->type);
+                OP_ARG_ERROR(2, TF_POINTER|TF_MAPPING|TF_STRING|TF_BYTES|TF_LPCTYPE, sp);
                 /* NOTREACHED */
         }
 
@@ -13525,6 +13844,14 @@ again:
         /* Compute the binary complement of number sp[0] and leave
          * that on the stack.
          */
+#ifdef USE_PYTHON
+        if (sp->type == T_PYTHON)
+        {
+            sp = do_python_unary_operation(sp, PYTHON_OP_INVERT, "~");
+            break;
+        }
+#endif
+
         TYPE_TEST1(sp, T_NUMBER);
         sp->u.number = ~ sp->u.number;
         break;
@@ -13542,8 +13869,17 @@ again:
          *   vector & mapping  -> vector
          *   mapping & vector  -> mapping
          *   mapping & mapping -> mapping
+         *   lpctype & lpctype -> lpctype
          *
          */
+
+#ifdef USE_PYTHON
+        if (sp[0].type == T_PYTHON || sp[-1].type == T_PYTHON)
+        {
+            sp = do_python_binary_operation(sp, PYTHON_OP_AND, PYTHON_OP_RAND, "&");
+            break;
+        }
+#endif
 
         if (sp->type == T_POINTER && (sp-1)->type == T_POINTER)
         {
@@ -13593,8 +13929,22 @@ again:
             break;
         }
 
-        TYPE_TEST_EXP_LEFT((sp-1), TF_NUMBER|TF_STRING|TF_BYTES|TF_POINTER|TF_MAPPING);
-        TYPE_TEST_EXP_RIGHT(sp, TF_NUMBER|TF_STRING|TF_BYTES|TF_POINTER|TF_MAPPING);
+        if (sp->type == T_LPCTYPE && (sp-1)->type == T_LPCTYPE)
+        {
+            lpctype_t * result = get_common_type(sp[-1].u.lpctype, sp[0].u.lpctype);
+
+            free_lpctype(sp[-1].u.lpctype);
+            free_lpctype(sp[0].u.lpctype);
+            sp--;
+            if (result)
+                sp->u.lpctype = result;
+            else
+                sp->u.lpctype = lpctype_void;
+            break;
+        }
+
+        TYPE_TEST_EXP_LEFT((sp-1), TF_NUMBER|TF_STRING|TF_BYTES|TF_POINTER|TF_MAPPING|TF_LPCTYPE);
+        TYPE_TEST_EXP_RIGHT(sp, TF_NUMBER|TF_STRING|TF_BYTES|TF_POINTER|TF_MAPPING|TF_LPCTYPE);
         ERRORF(("Arguments to & don't match: %s vs %s\n"
                , typename(sp[-1].type), typename(sp->type)
                ));
@@ -13607,13 +13957,22 @@ again:
          * the result on the stack.
          *
          * Possible type combinations:
-         *   int    | int    -> int
-         *   array  | array  -> array
+         *   int     | int     -> int
+         *   array   | array   -> array
+         *   lpctype | lpctype -> lpctype
          *
          * TODO: Extend this to mappings.
          */
 
-        TYPE_TEST_EXP_LEFT((sp-1), TF_NUMBER|TF_POINTER);
+#ifdef USE_PYTHON
+        if (sp[0].type == T_PYTHON || sp[-1].type == T_PYTHON)
+        {
+            sp = do_python_binary_operation(sp, PYTHON_OP_OR, PYTHON_OP_ROR, "|");
+            break;
+        }
+#endif
+
+        TYPE_TEST_EXP_LEFT((sp-1), TF_NUMBER|TF_POINTER|TF_LPCTYPE);
         if ((sp-1)->type == T_NUMBER)
         {
             TYPE_TEST_RIGHT(sp, T_NUMBER);
@@ -13628,6 +13987,16 @@ again:
             inter_pc = pc;
             sp--;
             sp->u.vec = join_array(sp->u.vec, (sp+1)->u.vec);
+        }
+        else if (sp->type == T_LPCTYPE && (sp-1)->type == T_LPCTYPE)
+        {
+            TYPE_TEST_RIGHT(sp, T_LPCTYPE);
+            lpctype_t * result = get_union_type(sp[-1].u.lpctype, sp[0].u.lpctype);
+
+            free_lpctype(sp[-1].u.lpctype);
+            free_lpctype(sp[0].u.lpctype);
+            sp--;
+            sp->u.lpctype = result;
         }
 
         break;
@@ -13644,6 +14013,14 @@ again:
          *
          * TODO: Extend this to mappings.
          */
+
+#ifdef USE_PYTHON
+        if (sp[0].type == T_PYTHON || sp[-1].type == T_PYTHON)
+        {
+            sp = do_python_binary_operation(sp, PYTHON_OP_XOR, PYTHON_OP_RXOR, "^");
+            break;
+        }
+#endif
 
         TYPE_TEST_EXP_LEFT((sp-1), TF_NUMBER|TF_POINTER);
         if ((sp-1)->type == T_NUMBER)
@@ -13675,6 +14052,14 @@ again:
          * TODO: Implement an arithmetic shift.
          */
 
+#ifdef USE_PYTHON
+        if (sp[0].type == T_PYTHON || sp[-1].type == T_PYTHON)
+        {
+            sp = do_python_binary_operation(sp, PYTHON_OP_LSH, PYTHON_OP_RLSH, "<<");
+            break;
+        }
+#endif
+
         TYPE_TEST_LEFT((sp-1), T_NUMBER);
         TYPE_TEST_RIGHT(sp, T_NUMBER);
 
@@ -13694,6 +14079,14 @@ again:
          *
          * TODO: Extend this to vectors and mappings.
          */
+
+#ifdef USE_PYTHON
+        if (sp[0].type == T_PYTHON || sp[-1].type == T_PYTHON)
+        {
+            sp = do_python_binary_operation(sp, PYTHON_OP_RSH, PYTHON_OP_RRSH, ">>");
+            break;
+        }
+#endif
 
         TYPE_TEST_LEFT((sp-1), T_NUMBER);
         TYPE_TEST_RIGHT(sp, T_NUMBER);
@@ -13719,6 +14112,14 @@ again:
          *
          * TODO: Extend this to vectors and mappings.
          */
+
+#ifdef USE_PYTHON
+        if (sp[0].type == T_PYTHON || sp[-1].type == T_PYTHON)
+        {
+            sp = do_python_binary_operation(sp, PYTHON_OP_RSH, PYTHON_OP_RRSH, ">>>");
+            break;
+        }
+#endif
 
         TYPE_TEST_LEFT((sp-1), T_NUMBER);
         TYPE_TEST_RIGHT(sp, T_NUMBER);
@@ -13877,7 +14278,7 @@ again:
                 }
                 else
                 {
-                    OP_ARG_ERROR(2, TF_NUMBER, type2);
+                    OP_ARG_ERROR(2, TF_NUMBER, sp-1);
                     /* NOTREACHED */
                 }
                 break;
@@ -13898,6 +14299,16 @@ again:
 
         if(argp == NULL) /* Already handled. */
             break;
+
+#ifdef USE_PYTHON
+        if (argp->type == T_PYTHON || type2 == T_PYTHON)
+        {
+            sp = do_python_assignment_operation(sp, argp, PYTHON_OP_IADD, PYTHON_OP_ADD, PYTHON_OP_RADD, "+=");
+            if (instruction == F_VOID_ADD_EQ)
+                pop_stack();
+            break;
+        }
+#endif
 
         /* Now do it */
         switch(argp->type)
@@ -13963,7 +14374,7 @@ again:
             }
             else
             {
-                OP_ARG_ERROR(2, TF_STRING|TF_FLOAT|TF_NUMBER, type2);
+                OP_ARG_ERROR(2, TF_STRING|TF_FLOAT|TF_NUMBER, sp-1);
                 /* NOTREACHED */
             }
 
@@ -14025,7 +14436,7 @@ again:
             }
             else
             {
-                OP_ARG_ERROR(2, TF_NUMBER, type2);
+                OP_ARG_ERROR(2, TF_NUMBER, sp-1);
                 /* NOTREACHED */
             }
             break;
@@ -14033,7 +14444,7 @@ again:
         case T_MAPPING:  /* Add to a mapping */
             if (type2 != T_MAPPING)
             {
-                OP_ARG_ERROR(2, TF_MAPPING, type2);
+                OP_ARG_ERROR(2, TF_MAPPING, sp-1);
                 /* NOTREACHED */
             }
             else
@@ -14061,7 +14472,7 @@ again:
         case T_POINTER:  /* Add to an array */
             if (type2 != T_POINTER)
             {
-                OP_ARG_ERROR(2, TF_POINTER, type2);
+                OP_ARG_ERROR(2, TF_POINTER, sp-1);
                 /* NOTREACHED */
             }
             else
@@ -14104,14 +14515,14 @@ again:
             }
             else
             {
-                OP_ARG_ERROR(2, TF_FLOAT|TF_NUMBER, type2);
+                OP_ARG_ERROR(2, TF_FLOAT|TF_NUMBER, sp-1);
                 /* NOTREACHED */
             }
             break;
 
         default:
             OP_ARG_ERROR(1, TF_STRING|TF_BYTES|TF_FLOAT|TF_MAPPING|TF_POINTER|TF_NUMBER
-                        , argp->type);
+                        , argp);
             /* NOTREACHED */
         } /* end of switch */
 
@@ -14197,7 +14608,7 @@ again:
                 }
                 else
                 {
-                    OP_ARG_ERROR(2, TF_NUMBER, type2);
+                    OP_ARG_ERROR(2, TF_NUMBER, sp-1);
                     /* NOTREACHED */
                 }
                 break;
@@ -14218,6 +14629,14 @@ again:
 
         if(argp == NULL) /* Already handled. */
             break;
+
+#ifdef USE_PYTHON
+        if (argp->type == T_PYTHON || type2 == T_PYTHON)
+        {
+            sp = do_python_assignment_operation(sp, argp, PYTHON_OP_ISUB, PYTHON_OP_SUB, PYTHON_OP_RSUB, "-=");
+            break;
+        }
+#endif
 
         /* Now do it */
         switch (argp->type)
@@ -14254,7 +14673,7 @@ again:
             else
             {
                 /* type2 of the wrong type */
-                OP_ARG_ERROR(2, TF_NUMBER|TF_FLOAT, type2);
+                OP_ARG_ERROR(2, TF_NUMBER|TF_FLOAT, sp-1);
                 /* NOTREACHED */
             }
             break;
@@ -14272,7 +14691,7 @@ again:
             }
             else
             {
-                BAD_OP_ARG(2, argp->type, type2);
+                BAD_OP_ARG(2, argp->type, sp-1);
                 /* NOTREACHED */
             }
             break;
@@ -14301,7 +14720,7 @@ again:
             }
             else
             {
-                OP_ARG_ERROR(2, TF_POINTER, type2);
+                OP_ARG_ERROR(2, TF_POINTER, sp-1);
                 /* NOTREACHED */
             }
             break;
@@ -14334,7 +14753,7 @@ again:
             }
             else
             {
-                OP_ARG_ERROR(2, TF_FLOAT|TF_NUMBER, type2);
+                OP_ARG_ERROR(2, TF_FLOAT|TF_NUMBER, sp-1);
                 /* NOTREACHED */
             }
             break;
@@ -14370,14 +14789,14 @@ again:
             }
             else
             {
-                OP_ARG_ERROR(2, TF_MAPPING, type2);
+                OP_ARG_ERROR(2, TF_MAPPING, sp-1);
                 /* NOTREACHED */
             }
             break;
 
         default:
             OP_ARG_ERROR(1, TF_STRING|TF_BYTES|TF_FLOAT|TF_MAPPING|TF_POINTER|TF_NUMBER
-                        , argp->type);
+                        , argp);
             /* NOTREACHED */
         } /* end of switch */
 
@@ -14475,7 +14894,7 @@ again:
                 }
                 else
                 {
-                    OP_ARG_ERROR(2, TF_NUMBER, sp[-1].type);
+                    OP_ARG_ERROR(2, TF_NUMBER, sp-1);
                     /* NOTREACHED */
                 }
                 break;
@@ -14496,6 +14915,14 @@ again:
 
         if(argp == NULL) /* Already handled. */
             break;
+
+#ifdef USE_PYTHON
+        if (argp->type == T_PYTHON || sp[-1].type == T_PYTHON)
+        {
+            sp = do_python_assignment_operation(sp, argp, PYTHON_OP_IMUL, PYTHON_OP_MUL, PYTHON_OP_RMUL, "*=");
+            break;
+        }
+#endif
 
         /* Now do it */
         switch (argp->type)
@@ -14562,7 +14989,7 @@ again:
             else
             {
                 /* Unsupported type2 */
-                OP_ARG_ERROR(2, TF_NUMBER|TF_FLOAT, sp[-1].type);
+                OP_ARG_ERROR(2, TF_NUMBER|TF_FLOAT, sp-1);
                 /* NOTREACHED */
             }
             break;
@@ -14592,7 +15019,7 @@ again:
             }
             else
             {
-                OP_ARG_ERROR(2, TF_NUMBER|TF_FLOAT, sp[-1].type);
+                OP_ARG_ERROR(2, TF_NUMBER|TF_FLOAT, sp-1);
                 /* NOTREACHED */
             }
             break;
@@ -14635,7 +15062,7 @@ again:
             }
             else
             {
-                OP_ARG_ERROR(2, TF_NUMBER, sp[-1].type);
+                OP_ARG_ERROR(2, TF_NUMBER, sp-1);
                 /* NOTREACHED */
             }
             break;
@@ -14689,14 +15116,14 @@ again:
             }
             else
             {
-                OP_ARG_ERROR(2, TF_NUMBER, sp[-1].type);
+                OP_ARG_ERROR(2, TF_NUMBER, sp-1);
                 /* NOTREACHED */
             }
             break;
 
         default:
             OP_ARG_ERROR(1, TF_STRING|TF_BYTES|TF_FLOAT|TF_POINTER|TF_NUMBER
-                        , argp->type);
+                        , argp);
             /* NOTREACHED */
             break;
         }
@@ -14757,15 +15184,18 @@ again:
                 }
                 else
                 {
-                    OP_ARG_ERROR(2, TF_NUMBER, sp[-1].type);
+                    OP_ARG_ERROR(2, TF_NUMBER, sp-1);
                     /* NOTREACHED */
                 }
                 break;
 
             case LVALUE_UNPROTECTED_RANGE:
             case LVALUE_UNPROTECTED_MAP_RANGE:
-                OP_ARG_ERROR(2, TF_FLOAT|TF_NUMBER, T_POINTER);
+            {
+                svalue_t error_vector = { T_POINTER, {}, {.vec = &null_vector} };
+                OP_ARG_ERROR(2, TF_FLOAT|TF_NUMBER, &error_vector);
                 break; /* NOTREACHED */
+            }
 
             case LVALUE_UNPROTECTED_MAPENTRY:
                 argp = get_map_lvalue(current_unprotected_mapentry.map, &(current_unprotected_mapentry.key)) + current_unprotected_mapentry.index;
@@ -14775,6 +15205,14 @@ again:
 
         if(argp == NULL) /* Already handled. */
             break;
+
+#ifdef USE_PYTHON
+        if (argp->type == T_PYTHON || sp[-1].type == T_PYTHON)
+        {
+            sp = do_python_assignment_operation(sp, argp, PYTHON_OP_IDIV, PYTHON_OP_DIV, PYTHON_OP_RDIV, "/=");
+            break;
+        }
+#endif
 
         /* Now do it */
         switch (argp->type)
@@ -14808,7 +15246,7 @@ again:
             else
             {
                 /* Unsupported type2 */
-                OP_ARG_ERROR(2, TF_NUMBER|TF_FLOAT, sp[-1].type);
+                OP_ARG_ERROR(2, TF_NUMBER|TF_FLOAT, sp-1);
                 /* NOTREACHED */
             }
             break;
@@ -14845,13 +15283,13 @@ again:
             }
             else
             {
-                OP_ARG_ERROR(2, TF_NUMBER|TF_FLOAT, sp[-1].type);
+                OP_ARG_ERROR(2, TF_NUMBER|TF_FLOAT, sp-1);
                 /* NOTREACHED */
             }
             break;
 
         default:
-            OP_ARG_ERROR(1, TF_FLOAT|TF_NUMBER, argp->type);
+            OP_ARG_ERROR(1, TF_FLOAT|TF_NUMBER, argp);
             /* NOTREACHED */
         }
 
@@ -14911,15 +15349,18 @@ again:
                 }
                 else
                 {
-                    OP_ARG_ERROR(2, TF_NUMBER, sp[-1].type);
+                    OP_ARG_ERROR(2, TF_NUMBER, sp-1);
                     /* NOTREACHED */
                 }
                 break;
 
             case LVALUE_UNPROTECTED_RANGE:
             case LVALUE_UNPROTECTED_MAP_RANGE:
-                OP_ARG_ERROR(2, TF_NUMBER, T_POINTER);
+            {
+                svalue_t error_vector = { T_POINTER, {}, {.vec = &null_vector} };
+                OP_ARG_ERROR(2, TF_NUMBER, &error_vector);
                 break; /* NOTREACHED */
+            }
 
             case LVALUE_UNPROTECTED_MAPENTRY:
                 argp = get_map_lvalue(current_unprotected_mapentry.map, &(current_unprotected_mapentry.key)) + current_unprotected_mapentry.index;
@@ -14929,6 +15370,14 @@ again:
 
         if(argp == NULL) /* Already handled. */
             break;
+
+#ifdef USE_PYTHON
+        if (argp->type == T_PYTHON || sp[-1].type == T_PYTHON)
+        {
+            sp = do_python_assignment_operation(sp, argp, PYTHON_OP_IMOD, PYTHON_OP_MOD, PYTHON_OP_RMOD, "%=");
+            break;
+        }
+#endif
 
         /* Now do it */
         switch (argp->type)
@@ -14942,13 +15391,13 @@ again:
             }
             else
             {
-                OP_ARG_ERROR(2, TF_NUMBER, sp[-1].type);
+                OP_ARG_ERROR(2, TF_NUMBER, sp-1);
                 /* NOTREACHED */
             }
             break;
 
         default:
-            OP_ARG_ERROR(1, TF_NUMBER, argp->type);
+            OP_ARG_ERROR(1, TF_NUMBER, argp);
             /* NOTREACHED */
         }
 
@@ -14970,6 +15419,7 @@ again:
          *   array  & mapping -> array
          *   mapping & array -> mapping
          *   mapping & mapping -> mapping
+         *   lpctype & lpctype -> lpctype
          */
 
         svalue_t *argp;
@@ -15007,7 +15457,7 @@ again:
                 }
                 else
                 {
-                    OP_ARG_ERROR(2, TF_NUMBER, sp[-1].type);
+                    OP_ARG_ERROR(2, TF_NUMBER, sp-1);
                     /* NOTREACHED */
                 }
                 break;
@@ -15029,6 +15479,14 @@ again:
         if(argp == NULL) /* Already handled. */
             break;
 
+#ifdef USE_PYTHON
+        if (argp->type == T_PYTHON || sp[-1].type == T_PYTHON)
+        {
+            sp = do_python_assignment_operation(sp, argp, PYTHON_OP_IAND, PYTHON_OP_AND, PYTHON_OP_RAND, "&=");
+            break;
+        }
+#endif
+
         /* Now do it */
         switch (argp->type)
         {
@@ -15039,7 +15497,7 @@ again:
             }
             else
             {
-                OP_ARG_ERROR(2, TF_NUMBER, sp[-1].type);
+                OP_ARG_ERROR(2, TF_NUMBER, sp-1);
                 /* NOTREACHED */
             }
             break;
@@ -15084,7 +15542,7 @@ again:
             }
             else
             {
-                OP_ARG_ERROR(2, TF_POINTER|TF_MAPPING, sp[-1].type);
+                OP_ARG_ERROR(2, TF_POINTER|TF_MAPPING, sp-1);
                 /* NOTREACHED */
             }
             break;
@@ -15099,7 +15557,7 @@ again:
             }
             else
             {
-                OP_ARG_ERROR(2, TF_MAPPING|TF_POINTER, sp[-1].type);
+                OP_ARG_ERROR(2, TF_MAPPING|TF_POINTER, sp-1);
                 /* NOTREACHED */
             }
             break;
@@ -15118,12 +15576,30 @@ again:
             }
             else
             {
-                BAD_OP_ARG(2, argp->type, sp[-1].type);
+                BAD_OP_ARG(2, argp->type, sp-1);
                 /* NOTREACHED */
             }
             break;
+
+        case T_LPCTYPE:
+            if (sp[-1].type == T_LPCTYPE)
+            {
+                lpctype_t * result = get_common_type(argp->u.lpctype, sp[-1].u.lpctype);
+
+                free_lpctype(argp->u.lpctype);
+                if (result)
+                    argp->u.lpctype = result;
+                else
+                    argp->u.lpctype = lpctype_void;
+            }
+            else
+            {
+                OP_ARG_ERROR(2, TF_LPCTYPE, sp-1);
+            }
+            break;
+
         default:
-            OP_ARG_ERROR(1, TF_NUMBER|TF_STRING|TF_BYTES|TF_POINTER, argp->type);
+            OP_ARG_ERROR(1, TF_NUMBER|TF_STRING|TF_BYTES|TF_POINTER|TF_LPCTYPE, argp);
             /* NOTREACHED */
         }
 
@@ -15176,7 +15652,7 @@ again:
                 }
                 else
                 {
-                    OP_ARG_ERROR(2, TF_NUMBER, sp[-1].type);
+                    OP_ARG_ERROR(2, TF_NUMBER, sp-1);
                     /* NOTREACHED */
                 }
                 break;
@@ -15198,6 +15674,14 @@ again:
         if(argp == NULL) /* Already handled. */
             break;
 
+#ifdef USE_PYTHON
+        if (argp->type == T_PYTHON || sp[-1].type == T_PYTHON)
+        {
+            sp = do_python_assignment_operation(sp, argp, PYTHON_OP_IOR, PYTHON_OP_OR, PYTHON_OP_ROR, "|=");
+            break;
+        }
+#endif
+
         /* Now do it */
         switch (argp->type)
         {
@@ -15208,7 +15692,7 @@ again:
             }
             else
             {
-                OP_ARG_ERROR(2, TF_NUMBER, sp[-1].type);
+                OP_ARG_ERROR(2, TF_NUMBER, sp-1);
                 /* NOTREACHED */
             }
             break;
@@ -15231,13 +15715,27 @@ again:
             }
             else
             {
-                OP_ARG_ERROR(2, TF_POINTER, sp[-1].type);
+                OP_ARG_ERROR(2, TF_POINTER, sp-1);
                 /* NOTREACHED */
             }
             break;
 
+        case T_LPCTYPE:
+            if (sp[-1].type == T_LPCTYPE)
+            {
+                lpctype_t * result = get_union_type(argp->u.lpctype, sp[-1].u.lpctype);
+
+                free_lpctype(argp->u.lpctype);
+                argp->u.lpctype = result;
+            }
+            else
+            {
+                OP_ARG_ERROR(2, TF_LPCTYPE, sp-1);
+            }
+            break;
+
         default:
-            OP_ARG_ERROR(1, TF_NUMBER|TF_POINTER, argp->type);
+            OP_ARG_ERROR(1, TF_NUMBER|TF_POINTER|TF_LPCTYPE, argp);
             /* NOTREACHED */
         }
 
@@ -15292,7 +15790,7 @@ again:
                 }
                 else
                 {
-                    OP_ARG_ERROR(2, TF_NUMBER, sp[-1].type);
+                    OP_ARG_ERROR(2, TF_NUMBER, sp-1);
                     /* NOTREACHED */
                 }
                 break;
@@ -15314,6 +15812,14 @@ again:
         if(argp == NULL) /* Already handled. */
             break;
 
+#ifdef USE_PYTHON
+        if (argp->type == T_PYTHON || sp[-1].type == T_PYTHON)
+        {
+            sp = do_python_assignment_operation(sp, argp, PYTHON_OP_IXOR, PYTHON_OP_XOR, PYTHON_OP_RXOR, "^=");
+            break;
+        }
+#endif
+
         /* Now do it */
         switch (argp->type)
         {
@@ -15324,7 +15830,7 @@ again:
             }
             else
             {
-                OP_ARG_ERROR(2, TF_NUMBER, sp[-1].type);
+                OP_ARG_ERROR(2, TF_NUMBER, sp-1);
                 /* NOTREACHED */
             }
             break;
@@ -15345,13 +15851,13 @@ again:
             }
             else
             {
-                OP_ARG_ERROR(2, TF_POINTER, sp[-1].type);
+                OP_ARG_ERROR(2, TF_POINTER, sp-1);
                 /* NOTREACHED */
             }
             break;
 
         default:
-            OP_ARG_ERROR(1, TF_NUMBER|TF_POINTER, argp->type);
+            OP_ARG_ERROR(1, TF_NUMBER|TF_POINTER, argp);
             /* NOTREACHED */
         }
 
@@ -15409,15 +15915,18 @@ again:
                 }
                 else
                 {
-                    OP_ARG_ERROR(2, TF_NUMBER, sp[-1].type);
+                    OP_ARG_ERROR(2, TF_NUMBER, sp-1);
                     /* NOTREACHED */
                 }
                 break;
 
             case LVALUE_UNPROTECTED_RANGE:
             case LVALUE_UNPROTECTED_MAP_RANGE:
-                OP_ARG_ERROR(2, TF_NUMBER, T_POINTER);
+            {
+                svalue_t error_vector = { T_POINTER, {}, {.vec = &null_vector} };
+                OP_ARG_ERROR(2, TF_NUMBER, &error_vector);
                 break; /* NOTREACHED */
+            }
 
             case LVALUE_UNPROTECTED_MAPENTRY:
                 argp = get_map_lvalue(current_unprotected_mapentry.map, &(current_unprotected_mapentry.key)) + current_unprotected_mapentry.index;
@@ -15427,6 +15936,14 @@ again:
 
         if(argp == NULL) /* Already handled. */
             break;
+
+#ifdef USE_PYTHON
+        if (argp->type == T_PYTHON || sp[-1].type == T_PYTHON)
+        {
+            sp = do_python_assignment_operation(sp, argp, PYTHON_OP_ILSH, PYTHON_OP_LSH, PYTHON_OP_RLSH, "<<=");
+            break;
+        }
+#endif
 
         /* Now do it */
         switch (argp->type)
@@ -15441,13 +15958,13 @@ again:
             }
             else
             {
-                OP_ARG_ERROR(2, TF_NUMBER, sp[-1].type);
+                OP_ARG_ERROR(2, TF_NUMBER, sp-1);
                 /* NOTREACHED */
             }
             break;
 
         default:
-            OP_ARG_ERROR(1, TF_NUMBER, argp->type);
+            OP_ARG_ERROR(1, TF_NUMBER, argp);
             /* NOTREACHED */
         }
 
@@ -15503,15 +16020,18 @@ again:
                 }
                 else
                 {
-                    OP_ARG_ERROR(2, TF_NUMBER, sp[-1].type);
+                    OP_ARG_ERROR(2, TF_NUMBER, sp-1);
                     /* NOTREACHED */
                 }
                 break;
 
             case LVALUE_UNPROTECTED_RANGE:
             case LVALUE_UNPROTECTED_MAP_RANGE:
-                OP_ARG_ERROR(2, TF_NUMBER, T_POINTER);
+            {
+                svalue_t error_vector = { T_POINTER, {}, {.vec = &null_vector} };
+                OP_ARG_ERROR(2, TF_NUMBER, &error_vector);
                 break; /* NOTREACHED */
+            }
 
             case LVALUE_UNPROTECTED_MAPENTRY:
                 argp = get_map_lvalue(current_unprotected_mapentry.map, &(current_unprotected_mapentry.key)) + current_unprotected_mapentry.index;
@@ -15521,6 +16041,14 @@ again:
 
         if(argp == NULL) /* Already handled. */
             break;
+
+#ifdef USE_PYTHON
+        if (argp->type == T_PYTHON || sp[-1].type == T_PYTHON)
+        {
+            sp = do_python_assignment_operation(sp, argp, PYTHON_OP_IRSH, PYTHON_OP_RSH, PYTHON_OP_RRSH, ">>=");
+            break;
+        }
+#endif
 
         /* Now do it */
         switch (argp->type)
@@ -15535,13 +16063,13 @@ again:
             }
             else
             {
-                OP_ARG_ERROR(2, TF_NUMBER, sp[-1].type);
+                OP_ARG_ERROR(2, TF_NUMBER, sp-1);
                 /* NOTREACHED */
             }
             break;
 
         default:
-            OP_ARG_ERROR(1, TF_NUMBER, argp->type);
+            OP_ARG_ERROR(1, TF_NUMBER, argp);
             /* NOTREACHED */
         }
 
@@ -15597,15 +16125,18 @@ again:
                 }
                 else
                 {
-                    OP_ARG_ERROR(2, TF_NUMBER, sp[-1].type);
+                    OP_ARG_ERROR(2, TF_NUMBER, sp-1);
                     /* NOTREACHED */
                 }
                 break;
 
             case LVALUE_UNPROTECTED_RANGE:
             case LVALUE_UNPROTECTED_MAP_RANGE:
-                OP_ARG_ERROR(2, TF_NUMBER, T_POINTER);
+            {
+                svalue_t error_vector = { T_POINTER, {}, {.vec = &null_vector} };
+                OP_ARG_ERROR(2, TF_NUMBER, &error_vector);
                 break; /* NOTREACHED */
+            }
 
             case LVALUE_UNPROTECTED_MAPENTRY:
                 argp = get_map_lvalue(current_unprotected_mapentry.map, &(current_unprotected_mapentry.key)) + current_unprotected_mapentry.index;
@@ -15615,6 +16146,14 @@ again:
 
         if(argp == NULL) /* Already handled. */
             break;
+
+#ifdef USE_PYTHON
+        if (argp->type == T_PYTHON || sp[-1].type == T_PYTHON)
+        {
+            sp = do_python_assignment_operation(sp, argp, PYTHON_OP_IRSH, PYTHON_OP_RSH, PYTHON_OP_RRSH, ">>>=");
+            break;
+        }
+#endif
 
         /* Now do it */
         switch (argp->type)
@@ -15629,13 +16168,13 @@ again:
             }
             else
             {
-                OP_ARG_ERROR(2, TF_NUMBER, sp[-1].type);
+                OP_ARG_ERROR(2, TF_NUMBER, sp-1);
                 /* NOTREACHED */
             }
             break;
 
         default:
-            OP_ARG_ERROR(1, TF_NUMBER, argp->type);
+            OP_ARG_ERROR(1, TF_NUMBER, argp);
             /* NOTREACHED */
         }
 
@@ -17439,7 +17978,7 @@ again:
          */
         struct_t * st;
         struct_type_t *pType;
-        short idx;
+        unsigned short idx;
         int num_values;
         Bool has_template;
         svalue_t * svp;
@@ -17448,7 +17987,7 @@ again:
         num_values = load_uint8(&pc);
         has_template = MY_FALSE;
 
-        if (idx < 0 && instruction == F_S_AGGREGATE)
+        if (idx == USHRT_MAX && instruction == F_S_AGGREGATE)
         {
             if ((sp - num_values)->type != T_STRUCT)
             {
@@ -17471,6 +18010,10 @@ again:
                 /* NOTREACHED */
             }
             has_template = MY_TRUE;
+        }
+        else if (idx >= STD_STRUCT_OFFSET)
+        {
+            pType = get_std_struct_type(idx - STD_STRUCT_OFFSET);
         }
         else
         {
@@ -17845,12 +18388,13 @@ again:
                                 assign_protected_lvalue_no_free(dest++, item + i);
                         }
 
+                        start = 0;
+                        count = r->index2 - r->index1;
+
                         free_svalue(sp);
                         put_array(sp, vec);
                         arg = sp;
 
-                        start = 0;
-                        count = r->index2 - r->index1;
                         break;
                     }
 
@@ -18122,7 +18666,7 @@ again:
                 /* Do runtime type checks. */
                 for (int i = 0; i <= left; i++)
                 {
-                    lpctype_t* exptype = current_prog->argument_types[typeidx + i];
+                    lpctype_t* exptype = current_prog->types[current_prog->argument_types[typeidx + i]];
                     svalue_t * val = i ? (values + i - 1) : (indices->item + ix);
                     if (!check_rtt_compatibility(exptype, val))
                     {
@@ -18290,7 +18834,7 @@ again:
             if (typeidx != USHRT_MAX && current_prog->argument_types)
             {
                 /* Do runtime type checks. */
-                lpctype_t* exptype = current_prog->argument_types[typeidx];
+                lpctype_t* exptype = current_prog->types[current_prog->argument_types[typeidx]];
                 if (!check_rtt_compatibility(exptype, val))
                 {
                     char buf[512];
@@ -18577,12 +19121,13 @@ again:
     }
 
     CASE(F_TYPE_CHECK);             /* --- type_check <op> <ix> --- */
+    CASE(F_LAMBDA_TYPE_CHECK);      /* --- lambda_type_check <op> <ix> --- */
     {
         /* Check the top value off the stack against the type
-         * at prog->argument_types[<ix>]. Raise an error if
-         * it doesn't match. Do nothing otherwise.
-         * <op> contains a value of enum type_check_operation to
-         * give a specific error message.
+         * at prog->types[<ix>] resp. lambda constant <ix>.
+         * Raise an error if it doesn't match.
+         * Do nothing otherwise. <op> contains a value of
+         * enum type_check_operation to give a specific error message.
          */
 
         unsigned short ix, op = LOAD_UINT8(pc);
@@ -18591,10 +19136,21 @@ again:
         LOAD_SHORT(ix, pc);
 
         /* Types were saved? */
-        if (!current_prog->argument_types)
-            break;
+        if (instruction == F_TYPE_CHECK)
+        {
+            if (!current_prog->types)
+                break;
 
-        exptype = current_prog->argument_types[ix];
+            exptype = current_prog->types[ix];
+        }
+        else /* F_LAMBDA_TYPE_CHECK */
+        {
+            svalue_t * cstart = (svalue_t *)((char *)(csp->funstart) - LAMBDA_VALUE_OFFSET);
+
+            assert(cstart[-ix].type == T_LPCTYPE);
+            exptype = cstart[-ix].u.lpctype;
+        }
+
         if (!check_rtt_compatibility(exptype, sp))
         {
             static char buff[512];
@@ -18637,6 +19193,23 @@ again:
         break;
     }
 
+    CASE(F_PUSH_TYPE);              /* --- push_type <ix> --- */
+    {
+        /* Push the type at prog->types[<ix>] as an lpctype onto
+         * the stack.
+         */
+        unsigned short ix;
+
+        LOAD_SHORT(ix, pc);
+
+        /* Types were saved? */
+        if (!current_prog->types)
+            break;
+
+        push_ref_lpctype(sp, current_prog->types[ix]);
+        break;
+    }
+
     /* --- Efuns: Miscellaneous --- */
 
     CASE(F_CLONEP);                 /* --- clonep              --- */
@@ -18654,6 +19227,8 @@ again:
          */
 
         int i;
+
+        CALL_PYTHON_TYPE_EFUN(F_CLONEP, 1);
 
         if (sp->type == T_OBJECT)
         {
@@ -18686,6 +19261,8 @@ again:
 
         int i;
 
+        CALL_PYTHON_TYPE_EFUN(F_CLOSUREP, 1);
+
         i = sp->type == T_CLOSURE;
         free_svalue(sp);
         put_number(sp, i);
@@ -18702,6 +19279,8 @@ again:
          */
 
         int i;
+
+        CALL_PYTHON_TYPE_EFUN(F_COROUTINEP, 1);
 
         i = sp->type == T_COROUTINE;
         free_svalue(sp);
@@ -18720,6 +19299,8 @@ again:
 
         int i;
 
+        CALL_PYTHON_TYPE_EFUN(F_FLOATP, 1);
+
         i = sp->type == T_FLOAT;
         free_svalue(sp);
         put_number(sp, i);
@@ -18736,6 +19317,8 @@ again:
          */
 
         int i;
+
+        CALL_PYTHON_TYPE_EFUN(F_INTP, 1);
 
         i = sp->type == T_NUMBER;
         free_svalue(sp);
@@ -18754,6 +19337,8 @@ again:
 
         int i;
 
+        CALL_PYTHON_TYPE_EFUN(F_MAPPINGP, 1);
+
         i = sp->type == T_MAPPING;
         free_svalue(sp);
         put_number(sp, i);
@@ -18770,6 +19355,8 @@ again:
          */
 
         int i;
+
+        CALL_PYTHON_TYPE_EFUN(F_OBJECTP, 1);
 
         i = sp->type == T_OBJECT;
         free_svalue(sp);
@@ -18788,6 +19375,8 @@ again:
 
         int i;
 
+        CALL_PYTHON_TYPE_EFUN(F_LWOBJECTP, 1);
+
         i = sp->type == T_LWOBJECT;
         free_svalue(sp);
         put_number(sp, i);
@@ -18804,6 +19393,8 @@ again:
          */
 
         int i;
+
+        CALL_PYTHON_TYPE_EFUN(F_POINTERP, 1);
 
         i = sp->type == T_POINTER;
         free_svalue(sp);
@@ -18822,6 +19413,9 @@ again:
          */
 
         int i = 0;
+
+        CALL_PYTHON_TYPE_EFUN(F_REFERENCEP, 1);
+
         if (sp->type == T_LVALUE)
         {
             /* It must be an protected lvalue with at least 3 references:
@@ -18874,6 +19468,8 @@ again:
 
         int i;
 
+        CALL_PYTHON_TYPE_EFUN(F_STRINGP, 1);
+
         i = sp->type == T_STRING;
         free_svalue(sp);
         put_number(sp, i);
@@ -18890,6 +19486,8 @@ again:
          */
 
         int i;
+
+        CALL_PYTHON_TYPE_EFUN(F_BYTESP, 1);
 
         i = sp->type == T_BYTES;
         free_svalue(sp);
@@ -18908,6 +19506,8 @@ again:
 
         int i;
 
+        CALL_PYTHON_TYPE_EFUN(F_STRUCTP, 1);
+
         i = sp->type == T_STRUCT;
         free_svalue(sp);
         put_number(sp, i);
@@ -18925,7 +19525,28 @@ again:
 
         int i;
 
+        CALL_PYTHON_TYPE_EFUN(F_SYMBOLP, 1);
+
         i = sp->type == T_SYMBOL;
+        free_svalue(sp);
+        put_number(sp, i);
+        break;
+    }
+
+    CASE(F_LPCTYPEP);               /* --- lpctypep            --- */
+    {
+        /* EFUN lpctypep()
+         *
+         *   int lpctypep(mixed)
+         *
+         * Returns 1 if the argument is an LPC type object.
+         */
+
+        int i;
+
+        CALL_PYTHON_TYPE_EFUN(F_LPCTYPEP, 1);
+
+        i = sp->type == T_LPCTYPE;
         free_svalue(sp);
         put_number(sp, i);
         break;
@@ -18940,6 +19561,8 @@ again:
          * Returns a code for the type of the argument, as defined in
          * <sys/lpctypes.h>
          */
+
+        CALL_PYTHON_TYPE_EFUN(F_TYPEOF, 1);
 
         mp_int i = sp->type;
         free_svalue(sp);
@@ -18957,6 +19580,13 @@ again:
          * it sees the unary '-' used.
          */
 
+#ifdef USE_PYTHON
+        if (sp->type == T_PYTHON)
+        {
+            sp = do_python_unary_operation(sp, PYTHON_OP_NEG, "-");
+            break;
+        }
+#endif
         if (sp->type == T_NUMBER)
         {
             if (sp->u.number == PINT_MIN)
@@ -18993,12 +19623,15 @@ again:
          * anywhere.
          */
 
+        CALL_PYTHON_TYPE_EFUN(F_RAISE_ERROR, 1);
+
         TYPE_TEST1(sp, T_STRING);
 
         ERRORF(("%s", get_txt(sp->u.str)));
       }
 
     CASE(F_THROW);                  /* --- throw               --- */
+    {
         /* EFUN throw()
          *
          *   void throw(mixed arg)
@@ -19008,10 +19641,14 @@ again:
          */
 
         assign_eval_cost_inl();
+
+        CALL_PYTHON_TYPE_EFUN(F_THROW, 1);
+
         inter_sp = --sp;
         inter_pc = pc;
         throw_error(sp+1); /* do the longjump, with extra checks... */
         break;
+    }
 
     /* --- Efuns: Arrays and Mappings --- */
 
@@ -19029,6 +19666,8 @@ again:
          */
 
         p_int i;
+
+        CALL_PYTHON_TYPE_EFUN(F_SIZEOF, 1);
 
         if (sp->type == T_STRING || sp->type == T_BYTES)
         {
@@ -19074,7 +19713,7 @@ again:
         if (sp->type == T_NUMBER && sp->u.number == 0)
             break;
 
-        RAISE_ARG_ERROR(1, TF_STRING|TF_BYTES|TF_STRUCT|TF_MAPPING|TF_POINTER, sp->type);
+        RAISE_ARG_ERROR(1, TF_STRING|TF_BYTES|TF_STRUCT|TF_MAPPING|TF_POINTER, sp);
         /* NOTREACHED */
     }
 
@@ -19140,6 +19779,8 @@ again:
          * If <dont_load> is true, the function just returns the current
          * master object, or 0 if the current master has been destructed.
          */
+
+        CALL_PYTHON_TYPE_EFUN(F_MASTER, 1);
 
         TYPE_TEST1(sp, T_NUMBER)
 
@@ -19245,11 +19886,13 @@ again:
         object_t *ob;
         int flags;
 
+        CALL_PYTHON_TYPE_EFUN(F_SWAP, 2);
+
         /* Test the arguments */
         if (sp[-1].type != T_OBJECT)
-            RAISE_ARG_ERROR(1, TF_OBJECT, sp[-1].type);
+            RAISE_ARG_ERROR(1, TF_OBJECT, sp-1);
         if (sp[0].type != T_NUMBER)
-            RAISE_ARG_ERROR(1, TF_NUMBER, sp[0].type);
+            RAISE_ARG_ERROR(1, TF_NUMBER, sp);
 
         ob = sp[-1].u.ob;
         flags = sp[0].u.number;
@@ -19379,6 +20022,7 @@ again:
 #   undef TYPE_TEST_TEMPL
 #   undef OP_TYPE_TEST_TEMPL
 #   undef EXP_TYPE_TEST_TEMPL
+#   undef CALL_PYTHON_TYPE_EFUN
 
 } /* eval_instruction() */
 
@@ -19917,9 +20561,7 @@ sapply_lwob_int (string_t *fun, lwobject_t *lwob, int num_arg, bool b_find_stati
     if (!apply_lwob(fun, lwob, num_arg, b_find_static, NULL))
         return NULL;
 
-    free_svalue(&apply_return_value);
-    transfer_svalue_no_free(&apply_return_value, inter_sp);
-    inter_sp--;
+    pop_apply_value();
 
 #ifdef DEBUG
     if (expected_sp != inter_sp)
@@ -19979,9 +20621,7 @@ sapply_int (string_t *fun, object_t *ob, int num_arg
             inter_sp = _pop_n_elems(num_arg, inter_sp);
         return NULL;
     }
-    free_svalue(&apply_return_value);
-    transfer_svalue_no_free(&apply_return_value, inter_sp);
-    inter_sp--;
+    pop_apply_value();
 
 #ifdef DEBUG
     if (expected_sp != inter_sp)
@@ -20654,7 +21294,7 @@ int_call_lambda (svalue_t *lsvp, int num_arg, bool external, svalue_t *bind_ob)
    */
 
     svalue_t *sp;
-    lambda_t *l = lsvp->u.lambda;
+    lambda_t *lambda = NULL; /* The lambda to execute if any. */
 
     sp = inter_sp;
 
@@ -20670,469 +21310,473 @@ int_call_lambda (svalue_t *lsvp, int num_arg, bool external, svalue_t *bind_ob)
 
     switch(lsvp->x.closure_type)
     {
-
-    case CLOSURE_LFUN:  /* --- lfun closure --- */
-      {
-        Bool      extra_frame;
-
-        if (l->ob.type == T_OBJECT)
+        case CLOSURE_LFUN:  /* --- lfun closure --- */
         {
-            /* Can't call from a destructed object */
-            if (l->ob.u.ob->flags & O_DESTRUCTED)
+            lfun_closure_t *l = lsvp->u.lfun_closure;
+            bool extra_frame;
+
+            if (l->base.ob.type == T_OBJECT)
             {
-                /* inter_sp == sp */
-                CLEAN_CSP
-                pop_n_elems(num_arg);
-                push_number(sp, 0);
-                inter_sp = sp;
-                return;
+                /* Can't call from a destructed object */
+                if (l->base.ob.u.ob->flags & O_DESTRUCTED)
+                {
+                    /* inter_sp == sp */
+                    CLEAN_CSP
+                    pop_n_elems(num_arg);
+                    push_number(sp, 0);
+                    inter_sp = sp;
+                    return;
+                }
+
+                /* Reference the bound and the originating object */
+                l->base.ob.u.ob->time_of_ref = current_time;
             }
 
-            /* Reference the bound and the originating object */
-            l->ob.u.ob->time_of_ref = current_time;
-        }
-
-        if (l->function.lfun.ob.type == T_OBJECT)
-        {
-            l->function.lfun.ob.u.ob->time_of_ref = current_time;
-            l->function.lfun.ob.u.ob->flags &= ~O_RESET_STATE;
-
-            /* Can't call a function in a destructed object */
-            if (l->function.lfun.ob.u.ob->flags & O_DESTRUCTED)
+            if (l->fun_ob.type == T_OBJECT)
             {
-                /* inter_sp == sp */
-                CLEAN_CSP
-                pop_n_elems(num_arg);
-                push_number(sp, 0);
-                inter_sp = sp;
-                return;
-            }
-        }
+                l->fun_ob.u.ob->time_of_ref = current_time;
+                l->fun_ob.u.ob->flags &= ~O_RESET_STATE;
 
-        /* Make the objects resident */
-        if ( (   current_object.type == T_OBJECT
-              && current_object.u.ob->flags & O_SWAPPED
-              && load_ob_from_swap(current_object.u.ob) < 0)
-         ||  (   l->function.lfun.ob.type == T_OBJECT
-              && l->function.lfun.ob.u.ob->flags & O_SWAPPED
-              && load_ob_from_swap(l->function.lfun.ob.u.ob) < 0)
-           )
-        {
-            /* inter_sp == sp */
-            CLEAN_CSP
-            errorf("Out of memory\n");
-            /* NOTREACHED */
-            return;
-        }
-
-        current_object = l->ob;
-
-        /* If the object creating the closure wasn't the one in which
-         * it will be executed, we need to record the fact in a second
-         * 'dummy' control frame. If we didn't, major security holes
-         * open up.
-         */
-
-        if (!object_svalue_eq(l->ob, l->function.lfun.ob))
-        {
-            extra_frame = MY_TRUE;
-            csp->extern_call = MY_TRUE;
-            csp->funstart = NULL;
-            push_control_stack(sp, 0, inter_fp, inter_context);
-            csp->ob = current_object;
-            csp->prev_ob = previous_ob;
-            csp->num_local_variables = num_arg;
-            previous_ob = current_object;
-            external = MY_TRUE;
-        }
-        else
-            extra_frame = MY_FALSE;
-
-        /* Finish the setup of the control frame.
-         * This is a real inter-object call.
-         */
-        csp->extern_call = external;
-        current_object = l->function.lfun.ob;
-        current_prog = get_current_object_program();
-
-#ifdef DEBUG
-        if (l->function.lfun.index >= current_prog->num_functions)
-            fatal("Calling non-existing lfun closure #%hu in program '%s' "
-                  "with %hu functions.\n"
-                 , l->function.lfun.index
-                 , get_txt(current_prog->name)
-                 , current_prog->num_functions
-                );
-#endif
-
-        /* inter_sp == sp */
-        setup_new_frame(l->function.lfun.index, l->function.lfun.inhProg);
-          
-        // check arguments
-        check_function_args(current_prog->function_headers[FUNCTION_HEADER_INDEX(csp->funstart)].offset.fx, current_prog, csp->funstart);
-        if (l->function.lfun.context_size > 0)
-            inter_context = l->context;
-        if (external)
-            eval_instruction(inter_pc, inter_sp);
-
-        /* If l->ob selfdestructs during the call, l might have been
-         * deallocated at this point!
-         */
-
-        /* If necessary, remove the second control frame */
-        if (extra_frame)
-        {
-            current_object = csp->ob;
-            previous_ob = csp->prev_ob;
-            pop_control_stack();
-        }
-
-        /* The result is on the stack (inter_sp) */
-        return;
-      }
-
-    case CLOSURE_IDENTIFIER:  /* --- variable closure --- */
-      {
-        short i; /* the signed variant of lambda_t->function.index */
-        svalue_t *vars;
-
-        CLEAN_CSP  /* no call will be done */
-
-        /* Ignore any arguments passed to a variable closure. */
-        pop_n_elems(num_arg);
-
-        if (l->ob.type == T_OBJECT)
-        {
-            /* Don't use variables in a destructed object */
-            if (l->ob.u.ob->flags & O_DESTRUCTED)
-            {
-                push_number(sp, 0);
-                inter_sp = sp;
-                return;
+                /* Can't call a function in a destructed object */
+                if (l->fun_ob.u.ob->flags & O_DESTRUCTED)
+                {
+                    /* inter_sp == sp */
+                    CLEAN_CSP
+                    pop_n_elems(num_arg);
+                    push_number(sp, 0);
+                    inter_sp = sp;
+                    return;
+                }
             }
 
-            /* Make the object resident */
-            if (   (l->ob.u.ob->flags & O_SWAPPED)
-                 && load_ob_from_swap(l->ob.u.ob) < 0
+            /* Make the objects resident */
+            if ( (   current_object.type == T_OBJECT
+                  && current_object.u.ob->flags & O_SWAPPED
+                  && load_ob_from_swap(current_object.u.ob) < 0)
+             ||  (   l->fun_ob.type == T_OBJECT
+                  && l->fun_ob.u.ob->flags & O_SWAPPED
+                  && load_ob_from_swap(l->fun_ob.u.ob) < 0)
                )
             {
-                errorf("Out of memory.\n");
+                /* inter_sp == sp */
+                CLEAN_CSP
+                errorf("Out of memory\n");
                 /* NOTREACHED */
                 return;
             }
-        }
 
-        /* Do we have the variable? */
-        if ( (i = (short)l->function.var_index) < 0)
-        {
-            errorf("Variable not inherited\n");
-            /* NOTREACHED */
+            current_object = l->base.ob;
+
+            /* If the object creating the closure wasn't the one in which
+             * it will be executed, we need to record the fact in a second
+             * 'dummy' control frame. If we didn't, major security holes
+             * open up.
+             */
+
+            if (!object_svalue_eq(l->base.ob, l->fun_ob))
+            {
+                extra_frame = MY_TRUE;
+                csp->extern_call = MY_TRUE;
+                csp->funstart = NULL;
+                push_control_stack(sp, 0, inter_fp, inter_context);
+                csp->ob = current_object;
+                csp->prev_ob = previous_ob;
+                csp->num_local_variables = num_arg;
+                previous_ob = current_object;
+                external = MY_TRUE;
+            }
+            else
+                extra_frame = MY_FALSE;
+
+            /* Finish the setup of the control frame.
+             * This is a real inter-object call.
+             */
+            csp->extern_call = external;
+            current_object = l->fun_ob;
+            current_prog = get_current_object_program();
+
+#ifdef DEBUG
+            if (l->fun_index >= current_prog->num_functions)
+                fatal("Calling non-existing lfun closure #%hu in program '%s' "
+                      "with %hu functions.\n"
+                     , l->fun_index
+                     , get_txt(current_prog->name)
+                     , current_prog->num_functions
+                    );
+#endif
+
+            /* inter_sp == sp */
+            setup_new_frame(l->fun_index, l->inhProg);
+
+            /* Check arguments. */
+            check_function_args(current_prog->function_headers[FUNCTION_HEADER_INDEX(csp->funstart)].offset.fx, current_prog, csp->funstart);
+            if (l->context_size > 0)
+                inter_context = l->context;
+            if (external)
+                eval_instruction(inter_pc, inter_sp);
+
+            /* If l->base.ob selfdestructs during the call, l might have been
+             * deallocated at this point!
+             */
+
+            /* If necessary, remove the second control frame */
+            if (extra_frame)
+            {
+                current_object = csp->ob;
+                previous_ob = csp->prev_ob;
+                pop_control_stack();
+            }
+
+            /* The result is on the stack (inter_sp) */
             return;
         }
 
-        if (l->ob.type == T_OBJECT)
+        case CLOSURE_IDENTIFIER:  /* --- variable closure --- */
         {
-            l->ob.u.ob->time_of_ref = current_time;
-            vars = l->ob.u.ob->variables;
-#ifdef DEBUG
-            if (!vars)
-                fatal("%s Fatal: call_lambda on variable for object %p '%s' "
-                      "w/o variables, index %d\n"
-                     , time_stamp(), l->ob.u.ob, get_txt(l->ob.u.ob->name), i);
-#endif
-        }
-        else
-        {
-            vars = l->ob.u.lwob->variables;
-#ifdef DEBUG
-            if (!vars)
-                fatal("%s Fatal: call_lambda on variable for lightweight object %p '/%s' "
-                      "w/o variables, index %d\n"
-                     , time_stamp(), l->ob.u.lwob, get_txt(l->ob.u.lwob->prog->name), i);
-#endif
-        }
+            identifier_closure_t *cl = lsvp->u.identifier_closure;
+            svalue_t *vars;
 
-        assign_svalue_no_free(++sp, vars+i);
-        inter_sp = sp;
-        return;
-      }
+            CLEAN_CSP  /* no call will be done */
 
-    case CLOSURE_BOUND_LAMBDA:  /* --- bound lambda closure --- */
-      {
-        lambda_t *l2;
+            /* Ignore any arguments passed to a variable closure. */
+            pop_n_elems(num_arg);
 
-        /* Deref the closure and then treat the resulting unbound
-         * lambda like a normal lambda
-         */
-        l2 = l->function.lambda;
-        l2->ob = l->ob;
-        l = l2;
-      }
-      /* FALLTHROUGH */
-
-    case CLOSURE_UNBOUND_LAMBDA:
-      if (lsvp->x.closure_type == CLOSURE_UNBOUND_LAMBDA)
-      {
-          if (!bind_ob)
-              break;
-
-          /* Internal call of an unbound closure.
-           * Bind it on the fly.
-           */
-          l->ob = *bind_ob;
-      }
-      /* FALLTHROUGH */
-
-    case CLOSURE_LAMBDA:
-      {
-        bytecode_p funstart;
-
-        if (l->ob.type == T_OBJECT)
-        {
-            /* Can't call from a destructed object */
-            if (l->ob.u.ob->flags & O_DESTRUCTED)
+            if (cl->base.ob.type == T_OBJECT)
             {
-                /* inter_sp == sp */
-                CLEAN_CSP
-                pop_n_elems(num_arg);
-                push_number(sp, 0);
-                inter_sp = sp;
-                return;
-            }
-
-            /* Make the object resident */
-            if (l->ob.u.ob->flags & O_SWAPPED
-             && load_ob_from_swap(l->ob.u.ob) < 0)
-            {
-                /* inter_sp == sp */
-                CLEAN_CSP
-                errorf("Out of memory\n");
-                /* NOTREACHED */
-                return;
-            }
-
-            /* Reference the object */
-            l->ob.u.ob->time_of_ref = current_time;
-            l->ob.u.ob->flags &= ~O_RESET_STATE;
-        }
-
-        current_object = l->ob;
-
-        /* Finish the setup */
-
-        current_prog = get_current_object_program();
-        current_lambda = *lsvp; addref_closure(lsvp, "call_lambda()");
-        variable_index_offset = 0;
-        function_index_offset = 0;
-        funstart = l->function.code.program;
-        csp->funstart = funstart;
-        csp->extern_call = external;
-        sp = setup_new_frame2(funstart, sp, MY_TRUE);
-
-        current_variables = get_current_object_variables();
-        current_strings = current_prog->strings;
-        if (external)
-            eval_instruction(inter_pc, sp);
-        else
-            inter_sp = sp;
-
-        /* The result is on the stack (inter_sp). */
-        return;
-      }
-
-    default: /* --- efun-, simul efun-, operator closure */
-      {
-        int i = lsvp->x.closure_type;  /* the closure type */
-
-        if (i < CLOSURE_LWO)
-        {
-            i -= CLOSURE_LWO;
-            set_current_lwobject(lsvp->u.lwob);
-        }
-        else
-        {
-            object_t *ob = lsvp->u.ob;
-
-            /* Can't call from a destructed object */
-            if (ob->flags & O_DESTRUCTED)
-            {
-                /* inter_sp == sp */
-                CLEAN_CSP
-                pop_n_elems(num_arg);
-                push_number(sp, 0);
-                inter_sp = sp;
-                return;
-            }
-
-            /* Make the object resident */
-            if (ob->flags & O_SWAPPED
-             && load_ob_from_swap(ob) < 0)
-            {
-                /* inter_sp == sp */
-                CLEAN_CSP
-                errorf("Out of memory\n");
-                /* NOTREACHED */
-                return;
-            }
-
-            /* Reference the object */
-            ob->time_of_ref = current_time;
-
-            set_current_object(ob);
-        }
-
-        if (i < CLOSURE_SIMUL_EFUN)
-        {
-            /* It's an operator or efun */
-
-            if (i == CLOSURE_EFUN + F_UNDEF)
-            {
-                /* The closure was discovered to be bound to a destructed
-                 * object and thus disabled.
-                 * This situation should no longer happen - in all situations
-                 * the closure should be zeroed out.
-                 */
-                CLEAN_CSP
-                pop_n_elems(num_arg);
-                push_number(sp, 0);
-                inter_sp = sp;
-                return;
-            }
-
-#ifdef USE_PYTHON
-            if (i >= CLOSURE_PYTHON_EFUN && i < CLOSURE_EFUN)
-            {
-                inter_pc = csp->funstart = PYTHON_EFUN_FUNSTART;
-                csp->instruction = i - CLOSURE_PYTHON_EFUN;
-                csp->num_local_variables = 0;
-
-                call_python_efun(i - CLOSURE_PYTHON_EFUN, num_arg);
-                CLEAN_CSP
-                return;
-            }
-#endif
-
-            i -= CLOSURE_EFUN;
-              /* Efuns have now a positive value, operators a negative one.
-               */
-
-            if (i >= 0
-             || instrs[i -= CLOSURE_OPERATOR-CLOSURE_EFUN].min_arg)
-            {
-                /* To call an operator or efun, we have to construct
-                 * a small piece of program with this instruction.
-                 */
-                bytecode_t code[9];    /* the code fragment */
-                bytecode_p p;          /* the code pointer */
-
-                int min, max, def;
-
-                min = instrs[i].min_arg;
-                max = instrs[i].max_arg;
-                p = code;
-
-                /* Fix up the number of arguments passed */
-                if (num_arg < min)
+                /* Don't use variables in a destructed object */
+                if (cl->base.ob.u.ob->flags & O_DESTRUCTED)
                 {
-                    /* Add some arguments */
-
-                    int f;
-
-                    if (num_arg == min-1
-                     && 0 != (def = instrs[i].Default) && def != -1)
-                    {
-                        /* We lack one argument for which a default
-                         * is provided.
-                         */
-                        if (instrs[def].prefix)
-                            *p++ = instrs[def].prefix;
-                        *p++ = instrs[def].opcode;
-                        max--;
-                        min--;
-                    }
-                    else
-                    {
-                        /* Maybe there is a fitting replacement efun */
-                        f = proxy_efun(i, num_arg);
-                        if (f >= 0)
-                            /* Yup, use that one */
-                            i = f;
-                        else
-                        {
-                            /* Nope. */
-                            csp->extern_call = MY_TRUE;
-                            inter_pc = csp->funstart = EFUN_FUNSTART;
-                            csp->instruction = i;
-                            errorf("Too few arguments to %s\n", instrs[i].name);
-                        }
-                    }
-                }
-                else if (num_arg > 0xff || (num_arg > max && max != -1))
-                {
-                    csp->extern_call = MY_TRUE;
-                    inter_pc = csp->funstart = EFUN_FUNSTART;
-                    csp->instruction = i;
-                    errorf("Too many arguments to %s\n", instrs[i].name);
+                    push_number(sp, 0);
+                    inter_sp = sp;
+                    return;
                 }
 
-                /* Store the instruction code */
-                if (instrs[i].prefix)
-                    *p++ = instrs[i].prefix;
-                *p++ = instrs[i].opcode;
-
-                /* And finally the return instruction */
-                if ( instrs[i].ret_type == lpctype_void )
-                    *p++ = F_RETURN0;
-                else
-                    *p++ = F_RETURN;
-
-                csp->instruction = i;
-                csp->funstart = EFUN_FUNSTART;
-                csp->num_local_variables = 0;
-                inter_fp = sp - num_arg + 1;
-                inter_context = NULL;
-                tracedepth++; /* Counteract the F_RETURN */
-                eval_instruction(code, sp);
-                /* The result is on the stack (inter_sp) */
-                return;
-            }
-            else
-            {
-                /* It is an operator or syntactic marker: fall through
-                 * to uncallable closure type.
-                 */
-                break;
-            }
-        }
-        else
-        {
-            /* simul_efun */
-            object_t *ob;
-
-            /* Mark the call as sefun closure */
-            inter_pc = csp->funstart = SIMUL_EFUN_FUNSTART;
-
-            /* Get the simul_efun object */
-            if ( !(ob = simul_efun_object) )
-            {
-                /* inter_sp == sp */
-                if (!assert_simul_efun_object()
-                 || !(ob = simul_efun_object)
+                /* Make the object resident */
+                if (   (cl->base.ob.u.ob->flags & O_SWAPPED)
+                     && load_ob_from_swap(cl->base.ob.u.ob) < 0
                    )
                 {
-                    csp->extern_call = MY_TRUE;
-                    errorf("Couldn't load simul_efun object\n");
+                    errorf("Out of memory.\n");
                     /* NOTREACHED */
                     return;
                 }
             }
-            call_simul_efun(i - CLOSURE_SIMUL_EFUN, ob, num_arg);
-            CLEAN_CSP
-        }
-        /* The result is on the stack (inter_sp) */
-        return;
-      }
 
+            /* Do we have the variable? */
+            if ( cl->var_index == VANISHED_VARCLOSURE_INDEX)
+            {
+                errorf("Variable not inherited\n");
+                /* NOTREACHED */
+                return;
+            }
+
+            if (cl->base.ob.type == T_OBJECT)
+            {
+                cl->base.ob.u.ob->time_of_ref = current_time;
+                vars = cl->base.ob.u.ob->variables;
+#ifdef DEBUG
+                if (!vars)
+                    fatal("%s Fatal: call_lambda on variable for object %p '%s' "
+                          "w/o variables, index %d\n"
+                         , time_stamp(), cl->base.ob.u.ob
+                         , get_txt(cl->base.ob.u.ob->name), cl->var_index);
+#endif
+            }
+            else
+            {
+                vars = cl->base.ob.u.lwob->variables;
+#ifdef DEBUG
+                if (!vars)
+                    fatal("%s Fatal: call_lambda on variable for lightweight object %p '/%s' "
+                          "w/o variables, index %d\n"
+                         , time_stamp(), cl->base.ob.u.lwob
+                         , get_txt(cl->base.ob.u.lwob->prog->name), cl->var_index);
+#endif
+            }
+
+            assign_svalue_no_free(++sp, vars+cl->var_index);
+            inter_sp = sp;
+            return;
+        }
+
+        case CLOSURE_BOUND_LAMBDA:  /* --- bound lambda closure --- */
+        {
+            /* Deref the closure and then treat the resulting unbound
+             * lambda like a normal lambda
+             */
+            lambda = lsvp->u.bound_lambda->lambda;
+            lambda->base.ob = lsvp->u.bound_lambda->base.ob;
+
+            /* FALLTHROUGH */
+        }
+
+        case CLOSURE_UNBOUND_LAMBDA:
+            if (lsvp->x.closure_type == CLOSURE_UNBOUND_LAMBDA)
+            {
+                if (!bind_ob)
+                    break;
+
+                /* Internal call of an unbound closure.
+                 * Bind it on the fly.
+                 */
+                lambda = lsvp->u.lambda;
+                lambda->base.ob = *bind_ob;
+            }
+            /* FALLTHROUGH */
+
+        case CLOSURE_LAMBDA:
+        {
+            bytecode_p funstart;
+
+            if (lsvp->x.closure_type == CLOSURE_LAMBDA)
+                lambda = lsvp->u.lambda;
+
+            if (lambda->base.ob.type == T_OBJECT)
+            {
+                /* Can't call from a destructed object */
+                if (lambda->base.ob.u.ob->flags & O_DESTRUCTED)
+                {
+                    /* inter_sp == sp */
+                    CLEAN_CSP
+                    pop_n_elems(num_arg);
+                    push_number(sp, 0);
+                    inter_sp = sp;
+                    return;
+                }
+
+                /* Make the object resident */
+                if (lambda->base.ob.u.ob->flags & O_SWAPPED
+                 && load_ob_from_swap(lambda->base.ob.u.ob) < 0)
+                {
+                    /* inter_sp == sp */
+                    CLEAN_CSP
+                    errorf("Out of memory\n");
+                    /* NOTREACHED */
+                    return;
+                }
+
+                /* Reference the object */
+                lambda->base.ob.u.ob->time_of_ref = current_time;
+                lambda->base.ob.u.ob->flags &= ~O_RESET_STATE;
+            }
+
+            current_object = lambda->base.ob;
+
+            /* Finish the setup */
+
+            current_prog = get_current_object_program();
+            internal_assign_svalue_no_free(&current_lambda, lsvp);
+            variable_index_offset = 0;
+            function_index_offset = 0;
+            funstart = lambda->program;
+            csp->funstart = funstart;
+            csp->extern_call = external;
+            sp = setup_new_frame2(funstart, sp, MY_TRUE);
+
+            current_variables = get_current_object_variables();
+            current_strings = current_prog->strings;
+            inter_context = ((svalue_t*)(void*)lambda) - lambda->num_values;
+            if (external)
+                eval_instruction(inter_pc, sp);
+            else
+                inter_sp = sp;
+
+            /* The result is on the stack (inter_sp). */
+            return;
+        }
+
+        default: /* --- efun-, simul efun-, operator closure */
+        {
+            int i = lsvp->x.closure_type;  /* the closure type */
+
+            if (i < CLOSURE_LWO)
+            {
+                i -= CLOSURE_LWO;
+                set_current_lwobject(lsvp->u.lwob);
+            }
+            else
+            {
+                object_t *ob = lsvp->u.ob;
+
+                /* Can't call from a destructed object */
+                if (ob->flags & O_DESTRUCTED)
+                {
+                    /* inter_sp == sp */
+                    CLEAN_CSP
+                    pop_n_elems(num_arg);
+                    push_number(sp, 0);
+                    inter_sp = sp;
+                    return;
+                }
+
+                /* Make the object resident */
+                if (ob->flags & O_SWAPPED
+                 && load_ob_from_swap(ob) < 0)
+                {
+                    /* inter_sp == sp */
+                    CLEAN_CSP
+                    errorf("Out of memory\n");
+                    /* NOTREACHED */
+                    return;
+                }
+
+                /* Reference the object */
+                ob->time_of_ref = current_time;
+
+                set_current_object(ob);
+            }
+
+            if (i < CLOSURE_SIMUL_EFUN)
+            {
+                /* It's an operator or efun */
+
+                if (i == CLOSURE_EFUN + F_UNDEF)
+                {
+                    /* The closure was discovered to be bound to a destructed
+                     * object and thus disabled.
+                     * This situation should no longer happen - in all situations
+                     * the closure should be zeroed out.
+                     */
+                    CLEAN_CSP
+                    pop_n_elems(num_arg);
+                    push_number(sp, 0);
+                    inter_sp = sp;
+                    return;
+                }
+
+#ifdef USE_PYTHON
+                if (i >= CLOSURE_PYTHON_EFUN && i < CLOSURE_EFUN)
+                {
+                    inter_pc = csp->funstart = PYTHON_EFUN_FUNSTART;
+                    csp->instruction = i - CLOSURE_PYTHON_EFUN;
+                    csp->num_local_variables = 0;
+
+                    call_python_efun(i - CLOSURE_PYTHON_EFUN, num_arg);
+                    CLEAN_CSP
+                    return;
+                }
+#endif
+
+                i -= CLOSURE_EFUN;
+                  /* Efuns have now a positive value, operators a negative one.
+                   */
+
+                if (i >= 0
+                 || instrs[i -= CLOSURE_OPERATOR-CLOSURE_EFUN].min_arg)
+                {
+                    /* To call an operator or efun, we have to construct
+                     * a small piece of program with this instruction.
+                     */
+                    bytecode_t code[9];    /* the code fragment */
+                    bytecode_p p;          /* the code pointer */
+
+                    int min, max, def;
+
+                    min = instrs[i].min_arg;
+                    max = instrs[i].max_arg;
+                    p = code;
+
+                    /* Fix up the number of arguments passed */
+                    if (num_arg < min)
+                    {
+                        /* Add some arguments */
+
+                        int f;
+
+                        if (num_arg == min-1
+                         && 0 != (def = instrs[i].Default) && def != -1)
+                        {
+                            /* We lack one argument for which a default
+                             * is provided.
+                             */
+                            if (instrs[def].prefix)
+                                *p++ = instrs[def].prefix;
+                            *p++ = instrs[def].opcode;
+                            max--;
+                            min--;
+                        }
+                        else
+                        {
+                            /* Maybe there is a fitting replacement efun */
+                            f = proxy_efun(i, num_arg);
+                            if (f >= 0)
+                                /* Yup, use that one */
+                                i = f;
+                            else
+                            {
+                                /* Nope. */
+                                csp->extern_call = MY_TRUE;
+                                inter_pc = csp->funstart = EFUN_FUNSTART;
+                                csp->instruction = i;
+                                errorf("Too few arguments to %s\n", instrs[i].name);
+                            }
+                        }
+                    }
+                    else if (num_arg > 0xff || (num_arg > max && max != -1))
+                    {
+                        csp->extern_call = MY_TRUE;
+                        inter_pc = csp->funstart = EFUN_FUNSTART;
+                        csp->instruction = i;
+                        errorf("Too many arguments to %s\n", instrs[i].name);
+                    }
+
+                    /* Store the instruction code */
+                    if (instrs[i].prefix)
+                        *p++ = instrs[i].prefix;
+                    *p++ = instrs[i].opcode;
+
+                    /* And finally the return instruction */
+                    if ( instrs[i].ret_type == lpctype_void )
+                        *p++ = F_RETURN0;
+                    else
+                        *p++ = F_RETURN;
+
+                    csp->instruction = i;
+                    csp->funstart = EFUN_FUNSTART;
+                    csp->num_local_variables = 0;
+                    inter_fp = sp - num_arg + 1;
+                    inter_context = NULL;
+                    tracedepth++; /* Counteract the F_RETURN */
+                    eval_instruction(code, sp);
+                    /* The result is on the stack (inter_sp) */
+                    return;
+                }
+                else
+                {
+                    /* It is an operator or syntactic marker: fall through
+                     * to uncallable closure type.
+                     */
+                    break;
+                }
+            }
+            else
+            {
+                /* simul_efun */
+                object_t *ob;
+
+                /* Mark the call as sefun closure */
+                inter_pc = csp->funstart = SIMUL_EFUN_FUNSTART;
+
+                /* Get the simul_efun object */
+                if ( !(ob = simul_efun_object) )
+                {
+                    /* inter_sp == sp */
+                    if (!assert_simul_efun_object()
+                     || !(ob = simul_efun_object)
+                       )
+                    {
+                        csp->extern_call = MY_TRUE;
+                        errorf("Couldn't load simul_efun object\n");
+                        /* NOTREACHED */
+                        return;
+                    }
+                }
+                call_simul_efun(i - CLOSURE_SIMUL_EFUN, ob, num_arg);
+                CLEAN_CSP
+            }
+            /* The result is on the stack (inter_sp) */
+            return;
+        }
     }
 
     CLEAN_CSP
@@ -21193,8 +21837,10 @@ secure_call_lambda (svalue_t *closure, int num_arg, bool external, svalue_t *bin
         if (external)
             mark_start_evaluation();
         call_lambda_ob(closure, num_arg, bind_ob);
-        transfer_svalue((result = &apply_return_value), inter_sp);
-        inter_sp--;
+
+        pop_apply_value();
+        result = &apply_return_value;
+
         if (external)
             mark_end_evaluation();
     }
@@ -21756,10 +22402,9 @@ get_line_number_if_any (string_t **name)
             memsafe(*name = new_mstring(name_buffer, STRING_ASCII), strlen(name_buffer)
                    , "lambda name");
             /* Find the beginning of the lambda structure.*/
-            l = (lambda_t *)( (PTRTYPE)(csp->funstart)
-                             - offsetof(lambda_t, function.code.program));
+            l = (lambda_t *)( (PTRTYPE)(csp->funstart) - offsetof(lambda_t, program));
 
-            location = closure_location(l);
+            location = closure_location(&(l->base));
 
             tmp = mstr_add(*name, location);
             if (tmp)
@@ -23079,57 +23724,50 @@ count_extra_ref_in_object (object_t *ob)
 
 /*-------------------------------------------------------------------------*/
 static void
-count_extra_ref_in_closure (lambda_t *l, ph_int type)
+count_extra_ref_in_base_closure (closure_base_t *cl, ph_int type)
 
 /* Count the extra refs in the closure <l> of type <type>.
  */
 
 {
-    if (CLOSURE_HAS_CODE(type))
-    {
-        /* We need to count the extra_refs in the constant values. */
-
-        mp_int num_values;
-        svalue_t *svp;
-
-        svp = (svalue_t *)l;
-        num_values = l->function.code.num_values;
-
-        svp -= num_values;
-        count_extra_ref_in_vector(svp, (size_t)num_values);
-    }
-    else
-    {
-        /* Count the referenced closures and objects */
-        if (type == CLOSURE_BOUND_LAMBDA)
-        {
-            lambda_t *l2 = l->function.lambda;
-
-            if (NULL != register_pointer(ptable, l2) )
-                count_extra_ref_in_closure(l2, CLOSURE_UNBOUND_LAMBDA);
-        }
-        else if (type == CLOSURE_LFUN)
-        {
-            count_extra_ref_in_vector(&(l->function.lfun.ob), 1);
-            if (l->function.lfun.inhProg)
-            {
-                l->function.lfun.inhProg->extra_ref++;
-                count_extra_ref_in_prog(l->function.lfun.inhProg);
-            }
-            count_extra_ref_in_vector(l->context, l->function.lfun.context_size);
-        }
-    }
-
     if (type != CLOSURE_UNBOUND_LAMBDA)
+        count_extra_ref_in_vector(&(cl->ob), 1);
+
+    if (cl->prog_ob)
+        count_extra_ref_in_object(cl->prog_ob);
+} /* count_extra_ref_in_base_closure() */
+
+/*-------------------------------------------------------------------------*/
+static void
+count_extra_ref_in_lfun_closure (lfun_closure_t *l)
+
+/* Count the extra refs in the closure <l> of type <type>.
+ */
+
+{
+    /* Count the referenced closures and objects */
+    count_extra_ref_in_vector(&(l->fun_ob), 1);
+    if (l->inhProg)
     {
-        count_extra_ref_in_vector(&(l->ob), 1);
+        l->inhProg->extra_ref++;
+        count_extra_ref_in_prog(l->inhProg);
     }
-    
-    if (l->prog_ob)
-    {
-        count_extra_ref_in_object(l->prog_ob);
-    }
-} /* count_extra_ref_in_closure() */
+
+    count_extra_ref_in_vector(l->context, l->context_size);
+
+} /* count_extra_ref_in_lfun_closure() */
+
+/*-------------------------------------------------------------------------*/
+static void
+count_extra_ref_in_lambda_closure (lambda_t *l)
+
+/* Count the extra refs in the closure <l> of type <type>.
+ */
+
+{
+    /* We need to count the extra_refs in the constant values. */
+    count_extra_ref_in_vector(((svalue_t *)l) - l->num_values, (size_t)l->num_values);
+} /* count_extra_ref_in_lambda_closure() */
 
 /*-------------------------------------------------------------------------*/
 void
@@ -23148,16 +23786,32 @@ count_extra_ref_in_vector (svalue_t *svp, size_t num)
     {
         switch(p->type)
         {
-
         case T_CLOSURE:
             if (CLOSURE_MALLOCED(p->x.closure_type))
             {
-                lambda_t *l;
-
-                l = p->u.lambda;
-                if ( NULL == register_pointer(ptable, l) )
+                if (NULL == register_pointer(ptable, p->u.closure))
                     continue;
-                count_extra_ref_in_closure(l, p->x.closure_type);
+                count_extra_ref_in_base_closure(p->u.closure, p->x.closure_type);
+
+                switch (p->x.closure_type)
+                {
+                    case CLOSURE_LFUN:
+                        count_extra_ref_in_lfun_closure(p->u.lfun_closure);
+                        break;
+
+                    case CLOSURE_BOUND_LAMBDA:
+                        count_extra_ref_in_base_closure(&(p->u.bound_lambda->lambda->base), CLOSURE_UNBOUND_LAMBDA);
+                        count_extra_ref_in_lambda_closure(p->u.bound_lambda->lambda);
+                        break;
+
+                    case CLOSURE_LAMBDA:
+                    case CLOSURE_UNBOUND_LAMBDA:
+                        count_extra_ref_in_lambda_closure(p->u.lambda);
+                        break;
+
+                    default:
+                        break;
+                }
             }
             else if (p->x.closure_type < CLOSURE_LWO)
             {
@@ -23190,8 +23844,7 @@ count_extra_ref_in_vector (svalue_t *svp, size_t num)
                     count_extra_ref_in_prog(cr->prog);
                 }
                 count_extra_ref_in_vector(&cr->ob, 1);
-                if (cr->closure && register_pointer(ptable, cr->closure) != NULL)
-                    count_extra_ref_in_closure(cr->closure, CLOSURE_LFUN);
+                count_extra_ref_in_vector(&cr->closure, 1);
                 if (cr->num_values > CR_RESERVED_EXTRA_VALUES)
                 {
                     count_extra_ref_in_vector(cr->variables, cr->num_variables);

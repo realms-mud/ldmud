@@ -404,6 +404,15 @@ char * domain_name = NULL;
   /* This computer's domain name, as needed by lex.c::get_domainname().
    */
 
+#define STRINGIFY(s) #s
+#define TO_STRING(s) STRINGIFY(s)
+struct listen_port_s port_numbers[MAXNUMPORTS] = { { LISTEN_PORT_ANY, TO_STRING(PORTNO), PORTNO } };
+  /* The login port numbers.
+   * Negative numbers are not ports, but the numbers of inherited
+   * socket file descriptors.
+   */
+int numports = 0;  /* Number of specified ports */
+
 static int min_nfds = 0;
   /* The number of fds used by the driver's sockets (udp, erq, login).
    * It is the number of the highest fd plus one.
@@ -931,6 +940,92 @@ set_socket_own (SOCKET_T new_socket)
 } /* set_socket_own() */
 
 /*-------------------------------------------------------------------------*/
+bool
+add_listen_port (const char *port)
+
+{
+    if (numports < MAXNUMPORTS)
+    {
+        const char* colon = strrchr(port, ':');
+        if (colon == NULL)
+        {
+            int p = atoi(port);
+            if (p <= 0)
+                return false;
+            port_numbers[numports++] = (struct listen_port_s){ LISTEN_PORT_ANY, port, p };
+            return true;
+        }
+        else
+        {
+            char* addr;
+            int length;
+            int p = atoi(colon+1);
+
+            if (p <= 0)
+                return false;
+
+            addr = strdup(port);
+            if (!addr)
+                return false;
+
+            length = colon - port;
+            addr[length] = 0;
+
+            port_numbers[numports] = (struct listen_port_s){ LISTEN_PORT_ADDR, port, p };
+
+#ifndef USE_IPV6
+            if (!inet_pton(AF_INET, addr, &(port_numbers[numports].addr)))
+            {
+                free(addr);
+                return false;
+            }
+            numports++;
+#else
+            if (length == 0)
+            {
+                port_numbers[numports].addr = in6addr_any;
+            }
+            else if (addr[0] == '[' && addr[length-1] == ']')
+            {
+                addr[length-1] = 0;
+                if (!inet_pton(AF_INET6, addr+1, &(port_numbers[numports].addr)))
+                {
+                    free(addr);
+                    return false;
+                }
+            }
+            else
+            {
+                free(addr);
+                return false;
+            }
+
+            numports++;
+            free(addr);
+            return true;
+#endif
+        }
+    }
+
+    return false;
+} /* add_listen_port() */
+
+/*-------------------------------------------------------------------------*/
+bool
+add_inherited_port (const char *port)
+
+{
+    int p = atoi(port);
+    if (p && numports < MAXNUMPORTS)
+    {
+        port_numbers[numports++] = (struct listen_port_s){ LISTEN_PORT_INHERITED, port, p };
+        return true;
+    }
+    else
+        return false;
+} /* add_inherited_port() */
+
+/*-------------------------------------------------------------------------*/
 void
 initialize_host_name (const char *hname)
 
@@ -1246,11 +1341,18 @@ prepare_ipc(void)
 
         memcpy(&host_ip_addr, &host_ip_addr_template, sizeof(host_ip_addr));
 
-        if (port_numbers[i] > 0)
+        if (port_numbers[i].type != LISTEN_PORT_INHERITED)
         {
             /* Real port number */
 
-            host_ip_addr.sin_port = htons((u_short)port_numbers[i]);
+            host_ip_addr.sin_port = htons((u_short)port_numbers[i].port);
+            if (port_numbers[i].type == LISTEN_PORT_ADDR)
+#ifndef USE_IPV6
+                host_ip_addr.sin_addr.s_addr = port_numbers[i].addr;
+#else
+                host_ip_addr.sin_addr = port_numbers[i].addr;
+#endif
+
             sos[i] = socket(host_ip_addr.sin_family, SOCK_STREAM, 0);
             if ((int)sos[i] == -1) {
                 perror("socket");
@@ -1264,10 +1366,10 @@ prepare_ipc(void)
             }
             if (bind(sos[i], (struct sockaddr *)&host_ip_addr, sizeof host_ip_addr) == -1) {
                 if (errno == EADDRINUSE) {
-                    fprintf(stderr, "%s Port %d already bound!\n"
-                                  , time_stamp(), port_numbers[i]);
-                    debug_message("%s Port %d already bound!\n"
-                                 , time_stamp(), port_numbers[i]);
+                    fprintf(stderr, "%s Port %s already bound!\n"
+                                  , time_stamp(), port_numbers[i].str);
+                    debug_message("%s Port %s already bound!\n"
+                                 , time_stamp(), port_numbers[i].str);
                     exit(errno);
                 } else {
                     perror("bind");
@@ -1279,10 +1381,18 @@ prepare_ipc(void)
 
             /* Existing socket */
 
-            sos[i] = -port_numbers[i];
+            sos[i] = port_numbers[i].port;
             tmp = sizeof(host_ip_addr);
             if (!getsockname(sos[i], (struct sockaddr *)&host_ip_addr, &tmp))
-                port_numbers[i] = ntohs(host_ip_addr.sin_port);
+            {
+                port_numbers[i].type = LISTEN_PORT_ADDR;
+                port_numbers[i].port = ntohs(host_ip_addr.sin_port);
+#ifndef USE_IPV6
+                port_numbers[i].addr = host_ip_addr.sin_addr.s_addr;
+#else
+                port_numbers[i].addr = host_ip_addr.sin_addr;
+#endif
+            }
         }
 
         /* Initialise the socket */
@@ -2627,7 +2737,7 @@ get_message (char *buff, size_t *bufflength)
                                               , &length);
                     if ((int)new_socket != -1)
                         new_player( NULL, new_socket, &addr, (size_t)length
-                                  , port_numbers[i]);
+                                  , port_numbers[i].port);
                     else if ((int)new_socket == -1
                       && errno != EWOULDBLOCK && errno != EINTR
                       && errno != EAGAIN && errno != EPROTO )
@@ -2641,13 +2751,13 @@ get_message (char *buff, size_t *bufflength)
                         int errorno = errno;
                         fprintf( stderr
                                , "%s comm: Can't accept on socket %d "
-                                 "(port %d): %s\n"
-                               , time_stamp(), sos[i], port_numbers[i]
+                                 "(port %s): %s\n"
+                               , time_stamp(), sos[i], port_numbers[i].str
                                , strerror(errorno)
                                );
                         debug_message("%s comm: Can't accept on socket %d "
-                                      "(port %d): %s\n"
-                                     , time_stamp(), sos[i], port_numbers[i]
+                                      "(port %s): %s\n"
+                                     , time_stamp(), sos[i], port_numbers[i].str
                                      , strerror(errorno)
                                      );
                         /* TODO: Was: perror(); abort(); */
@@ -3331,7 +3441,7 @@ refresh_access_data(void (*add_entry)(struct sockaddr_in *, int, long*) )
 
 /*-------------------------------------------------------------------------*/
 static INLINE void
-set_default_conn_charset (char charset[32])
+set_default_conn_charset (char charset[16])
 
 /* Set the default connection charset bitmask in <charset>.
  */
@@ -3343,7 +3453,7 @@ set_default_conn_charset (char charset[32])
 
 /*-------------------------------------------------------------------------*/
 static INLINE void
-set_default_combine_charset (char charset[32])
+set_default_combine_charset (char charset[16])
 
 /* Set the default combine charset bitmask in <charset>.
  */
@@ -5683,8 +5793,8 @@ start_erq_demon (const char *suffix, size_t suffixlen)
 #endif
     /* Close inherited sockets first. */
     for (i = 0; i < numports; i++)
-        if (port_numbers[i] < 0)
-            set_close_on_exec(-port_numbers[i]);
+        if (port_numbers[i].type == LISTEN_PORT_INHERITED)
+            set_close_on_exec(port_numbers[i].port);
 
     if ((pid = fork()) == 0)
     {
@@ -6049,7 +6159,7 @@ f_send_erq (svalue_t *sp)
             {
                 xfree(arg);
                 errorf("Bad arg 2 to send_erq(): got %s*, "
-                      "expected string/int*.\n", typename(svp[-1].type));
+                      "expected string/int*.\n", sv_typename(svp-1));
                 /* NOTREACHED */
                 return sp;
             }
@@ -6708,7 +6818,7 @@ f_send_udp (svalue_t *sp)
                 if (item == NULL || item->type != T_NUMBER)
                 {
                     errorf("Bad arg 3 to send_udp(): got %s*, "
-                          "expected string/int*.\n", typename(svp[-1].type));
+                          "expected string/int*.\n", sv_typename(svp-1));
                     /* NOTREACHED */
                     return sp;
                 }
@@ -6858,7 +6968,7 @@ f_binary_message (svalue_t *sp)
             {
                 free_mstring(msg);
                 errorf("Bad arg 1 to binary_message(): got %s*, "
-                      "expected string/int*.\n", typename(svp->type));
+                      "expected string/int*.\n", sv_typename(svp));
                 /* NOTREACHED */
                 return sp;
             }
@@ -7502,7 +7612,7 @@ v_find_input_to (svalue_t *sp, int num_arg)
             switch (arg[1].type)
             {
             case T_STRING:
-                if (!it->fun.is_lambda
+                if (!it->fun.is_closure
                  && mstreq(it->fun.function.named.name, arg[1].u.str))
                     found = MY_TRUE;
                 break;
@@ -7511,7 +7621,7 @@ v_find_input_to (svalue_t *sp, int num_arg)
                 if (num_arg > 2)
                 {
                     if (object_svalue_eq(callback_object(&(it->fun)), arg[1])
-                     && !it->fun.is_lambda
+                     && !it->fun.is_closure
                      && it->fun.function.named.name == arg[2].u.str
                        )
                         found = MY_TRUE;
@@ -7524,8 +7634,8 @@ v_find_input_to (svalue_t *sp, int num_arg)
                 break;
 
             case T_CLOSURE:
-                if (it->fun.is_lambda
-                 && closure_eq(&(it->fun.function.lambda), arg+1))
+                if (it->fun.is_closure
+                 && closure_eq(&(it->fun.function.closure), arg+1))
                     found = MY_TRUE;
                 break;
 
@@ -7656,7 +7766,7 @@ v_remove_input_to (svalue_t *sp, int num_arg)
             switch (arg[1].type)
             {
             case T_STRING:
-                if (!it->fun.is_lambda
+                if (!it->fun.is_closure
                  && mstreq(it->fun.function.named.name, arg[1].u.str))
                     found = MY_TRUE;
                 break;
@@ -7665,7 +7775,7 @@ v_remove_input_to (svalue_t *sp, int num_arg)
                 if (num_arg > 2)
                 {
                     if (object_svalue_eq(callback_object(&(it->fun)), arg[1])
-                     && !it->fun.is_lambda
+                     && !it->fun.is_closure
                      && it->fun.function.named.name == arg[2].u.str
                        )
                         found = MY_TRUE;
@@ -7678,8 +7788,8 @@ v_remove_input_to (svalue_t *sp, int num_arg)
                 break;
 
             case T_CLOSURE:
-                if (it->fun.is_lambda
-                 && closure_eq(&(it->fun.function.lambda), arg+1))
+                if (it->fun.is_closure
+                 && closure_eq(&(it->fun.function.closure), arg+1))
                     found = MY_TRUE;
                 break;
 
@@ -7805,13 +7915,13 @@ f_input_to_info (svalue_t *sp)
 
             vv = allocate_array(2 + it->fun.num_arg);
 
-            if (it->fun.is_lambda)
+            if (it->fun.is_closure)
             {
-                if (it->fun.function.lambda.x.closure_type == CLOSURE_LFUN)
-                    assign_object_svalue_no_free(vv->item, it->fun.function.lambda.u.lambda->function.lfun.ob, "input_to_info");
+                if (it->fun.function.closure.x.closure_type == CLOSURE_LFUN)
+                    assign_object_svalue_no_free(vv->item, it->fun.function.closure.u.lfun_closure->fun_ob, "input_to_info");
                 else
                     assign_object_svalue_no_free(vv->item, ob, "input_to_info");
-                assign_svalue_no_free(&vv->item[1], &it->fun.function.lambda);
+                assign_svalue_no_free(&vv->item[1], &it->fun.function.closure);
             }
             else
             {
@@ -8487,7 +8597,7 @@ f_configure_interactive (svalue_t *sp)
             int max;
 
             if (sp->type != T_NUMBER)
-                efun_exp_arg_error(3, TF_NUMBER, sp->type, sp);
+                efun_exp_arg_error(3, TF_NUMBER, sp, sp);
 
             max = sp->u.number;
             if (max < 0)
@@ -8504,7 +8614,7 @@ f_configure_interactive (svalue_t *sp)
         if (!ip)
             errorf("Default value for IC_SOCKET_BUFFER_SIZE is not supported.\n");
         if (sp->type != T_NUMBER)
-            efun_exp_arg_error(3, TF_NUMBER, sp->type, sp);
+            efun_exp_arg_error(3, TF_NUMBER, sp, sp);
 #ifdef SO_SNDBUF
         {
             int size = sp->u.number;
@@ -8520,7 +8630,7 @@ f_configure_interactive (svalue_t *sp)
         {
             case T_NUMBER:
                 if (sp->u.number != 0)
-                    efun_exp_arg_error(3, TF_STRING, sp->type, sp);
+                    efun_exp_arg_error(3, TF_STRING, sp, sp);
                 set_default_combine_charset(ip->combine_cset);
                 break;
 
@@ -8529,7 +8639,7 @@ f_configure_interactive (svalue_t *sp)
                 break;
 
             default:
-                efun_exp_arg_error(3, TF_STRING, sp->type, sp);
+                efun_exp_arg_error(3, TF_STRING, sp, sp);
         }
 
         /* Never combine \n or \0. */
@@ -8544,7 +8654,7 @@ f_configure_interactive (svalue_t *sp)
         {
             case T_NUMBER:
                 if (sp->u.number != 0)
-                    efun_exp_arg_error(3, TF_POINTER, sp->type, sp);
+                    efun_exp_arg_error(3, TF_POINTER, sp, sp);
                 set_default_combine_charset(ip->combine_cset);
                 break;
 
@@ -8553,7 +8663,7 @@ f_configure_interactive (svalue_t *sp)
                 break;
 
             default:
-                efun_exp_arg_error(3, TF_POINTER, sp->type, sp);
+                efun_exp_arg_error(3, TF_POINTER, sp, sp);
         }
 
         /* Never combine \n or \0. */
@@ -8568,7 +8678,7 @@ f_configure_interactive (svalue_t *sp)
         {
             case T_NUMBER:
                 if (sp->u.number != 0)
-                    efun_exp_arg_error(3, TF_STRING, sp->type, sp);
+                    efun_exp_arg_error(3, TF_STRING, sp, sp);
                 set_default_conn_charset(ip->charset);
                 break;
 
@@ -8577,7 +8687,7 @@ f_configure_interactive (svalue_t *sp)
                 break;
 
             default:
-                efun_exp_arg_error(3, TF_STRING, sp->type, sp);
+                efun_exp_arg_error(3, TF_STRING, sp, sp);
         }
         break;
 
@@ -8588,7 +8698,7 @@ f_configure_interactive (svalue_t *sp)
         {
             case T_NUMBER:
                 if (sp->u.number != 0)
-                    efun_exp_arg_error(3, TF_POINTER, sp->type, sp);
+                    efun_exp_arg_error(3, TF_POINTER, sp, sp);
                 set_default_conn_charset(ip->charset);
                 break;
 
@@ -8597,7 +8707,7 @@ f_configure_interactive (svalue_t *sp)
                 break;
 
             default:
-                efun_exp_arg_error(3, TF_POINTER, sp->type, sp);
+                efun_exp_arg_error(3, TF_POINTER, sp, sp);
         }
         break;
 
@@ -8606,7 +8716,7 @@ f_configure_interactive (svalue_t *sp)
             errorf("Default value for IC_QUOTE_IAC is not supported.\n");
 
         if (sp->type != T_NUMBER)
-            efun_exp_arg_error(3, TF_NUMBER, sp->type, sp);
+            efun_exp_arg_error(3, TF_NUMBER, sp, sp);
 
         ip->quote_iac = (char)sp->u.number;
         break;
@@ -8616,7 +8726,7 @@ f_configure_interactive (svalue_t *sp)
             errorf("Default value for IC_TELNET_ENABLED is not supported.\n");
 
         if (sp->type != T_NUMBER)
-            efun_exp_arg_error(3, TF_NUMBER, sp->type, sp);
+            efun_exp_arg_error(3, TF_NUMBER, sp, sp);
 
         ip->tn_enabled = (sp->u.number != 0);
         break;
@@ -8627,7 +8737,7 @@ f_configure_interactive (svalue_t *sp)
             errorf("Default value for IC_MCCP is not supported.\n");
 
         if (sp->type != T_NUMBER)
-            efun_exp_arg_error(3, TF_NUMBER, sp->type, sp);
+            efun_exp_arg_error(3, TF_NUMBER, sp, sp);
         else if(sp->u.number == 0)
         {
             /* Deactivating MCCP */
@@ -8665,7 +8775,7 @@ f_configure_interactive (svalue_t *sp)
             errorf("Default value for IC_PROMPT is not supported.\n");
 
         if (sp->type != T_STRING && sp->type != T_CLOSURE)
-            efun_exp_arg_error(3, TF_STRING|TF_CLOSURE, sp->type, sp);
+            efun_exp_arg_error(3, TF_STRING|TF_CLOSURE, sp, sp);
 
         if (sp->type == T_CLOSURE && sp->x.closure_type == CLOSURE_UNBOUND_LAMBDA)
             errorf("Bad arg 3 for configure_interactive with IC_PROMPT: lambda closure not bound\n");
@@ -8692,7 +8802,7 @@ f_configure_interactive (svalue_t *sp)
             errorf("Default value for IC_MAX_COMMANDS is not supported.\n");
 
         if (sp->type != T_NUMBER)
-            efun_exp_arg_error(3, TF_NUMBER, sp->type, sp);
+            efun_exp_arg_error(3, TF_NUMBER, sp, sp);
 
         if (sp->u.number < 0)
             ip->maxNumCmds = -1;
@@ -8705,7 +8815,7 @@ f_configure_interactive (svalue_t *sp)
             errorf("Default value for IC_MODIFY_COMMAND is not supported.\n");
 
         if (sp->type != T_OBJECT && (sp->type != T_NUMBER || sp->u.number != 0))
-            efun_exp_arg_error(3, TF_OBJECT, sp->type, sp);
+            efun_exp_arg_error(3, TF_OBJECT, sp, sp);
 
         if (ip->modify_command)
             free_object(ip->modify_command, "configure_interactive(IC_MODIFY_COMMAND)");
@@ -8718,7 +8828,7 @@ f_configure_interactive (svalue_t *sp)
 
     case IC_ENCODING:
         if (sp->type != T_STRING)
-            efun_exp_arg_error(3, TF_STRING, sp->type, sp);
+            efun_exp_arg_error(3, TF_STRING, sp, sp);
 
         if (mstrsize(sp->u.str) >= sizeof(default_player_encoding))
             errorf("Illegal value to arg 3 of configure_interactive with IC_ENCODING: Encoding name too long.\n");

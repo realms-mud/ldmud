@@ -154,6 +154,10 @@ struct ident_s
     ident_t *inferior;       /* Ident of same name, but lower type */
     union {                  /* Type-depend data: */
         struct defn define;  /*   Macro definition */
+#ifdef USE_PYTHON
+        unsigned short python_type_id;
+                             /* Index into python_type_table. */
+#endif
         int code;            /*   Reserved word: lexem code */
         struct {             /*   Global identifier: */
             unsigned short function;
@@ -182,6 +186,10 @@ struct ident_s
             unsigned short sefun_struct_id;
               /* struct index in the simul-efun's program's struct table.
                * == I_GLOBAL_SEFUN_STRUCT_NONE: not a simul-efun struct.
+               */
+            unsigned short std_struct_id;
+              /* Standard struct id. (Starting with 0.)
+               * == I_GLOBAL_STD_STRUCT_NONE: not a standard struct.
                */
 #ifdef USE_PYTHON
             unsigned short python_efun;
@@ -213,7 +221,10 @@ struct ident_s
 #define I_TYPE_GLOBAL     2  /* function, variable or efuns/simul_efuns */
 #define I_TYPE_LOCAL      3
 #define I_TYPE_RESWORD    4  /* reserved word */
-#define I_TYPE_DEFINE     5
+#ifdef USE_PYTHON
+#  define I_TYPE_PYTHON_TYPE 5
+#endif
+#define I_TYPE_DEFINE     6
 
 /* ident_t.global magic values */
 
@@ -225,6 +236,7 @@ struct ident_s
 #define I_GLOBAL_SEFUN_BY_NAME          (USHRT_MAX - 2) /* Has no entry in the table. */
 #define I_GLOBAL_STRUCT_NONE            (USHRT_MAX)
 #define I_GLOBAL_SEFUN_STRUCT_NONE      (USHRT_MAX)
+#define I_GLOBAL_STD_STRUCT_NONE        (USHRT_MAX)
 #ifdef USE_PYTHON
 #  define I_GLOBAL_PYTHON_EFUN_OTHER    (USHRT_MAX)
 #endif
@@ -282,7 +294,6 @@ enum efun_override_e
     OVERRIDE_LFUN  = 3,
     OVERRIDE_VAR   = 4,
 };
-typedef enum efun_override_e efun_override_t;
 
 /* --- Prototypes --- */
 
@@ -296,6 +307,7 @@ extern ident_t *lookfor_shared_identifier(const char *s, size_t len, int n, int 
 #define find_shared_identifier(s,n,d) lookfor_shared_identifier(s,strlen(s),n,d, false, false)
 #define make_shared_identifier_n(s,l,n,d) lookfor_shared_identifier(s,l,n,d, true, false)
 #define find_shared_identifier_n(s,l,n,d) lookfor_shared_identifier(s,l,n,d, false, false)
+#define insert_shared_identifier_n(s,l,n,d) lookfor_shared_identifier(s,l,n,d, true, true)
 #define make_shared_identifier_mstr(s,n,d) lookfor_shared_identifier(get_txt(s),mstrsize(s),n,d, true, false)
 #define find_shared_identifier_mstr(s,n,d) lookfor_shared_identifier(get_txt(s),mstrsize(s),n,d, false, false)
 #define insert_shared_identifier_mstr(s,n,d) lookfor_shared_identifier(get_txt(s),mstrsize(s),n,d, true, true)
@@ -305,6 +317,10 @@ extern int yylex(void);
 extern void end_new_file(void);
 extern void lex_close(char *msg);
 extern void start_new_file(int fd, const char * fname);
+extern void start_new_expr(string_t* str, bool end_detection);
+extern void end_new_expr();
+extern void start_new_block(string_t* str, bool end_detection);
+extern void end_new_block();
 extern char *get_f_name(int n);
 extern void free_defines(void);
 extern size_t show_lexer_status (strbuf_t * sbuf, Bool verbose);
