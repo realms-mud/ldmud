@@ -515,7 +515,7 @@ v_db_connect (svalue_t *sp, int num_args)
      * commands or temporary tables will be lost silently on reconnects. If
      * this becomes a problem for anybody we need to rethink this default.
      */
-#if MYSQL_VERSION_ID >= 50003
+#if 0
     {
         bool my_true = true;
         if (mysql_options(tmp->mysql_dat, MYSQL_OPT_RECONNECT, &my_true))
