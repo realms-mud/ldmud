@@ -554,7 +554,8 @@ call_modify_command (char *buff)
             push_c_string(inter_sp, buff);
             push_ref_object(inter_sp, command_giver, "call_modify_command");
             call_lambda_ob(&driver_hook[H_MODIFY_COMMAND], 2, inter_sp);
-            transfer_svalue(svp = &apply_return_value, inter_sp--);
+            pop_apply_value();
+            svp = &apply_return_value;
             if (!command_giver)
                 return MY_TRUE;
         }
@@ -582,7 +583,8 @@ call_modify_command (char *buff)
                     push_ref_string(inter_sp, sv.u.str);
                     push_ref_object(inter_sp, command_giver, "call_modify_command");
                     call_lambda_ob(svp, 2, inter_sp);
-                    transfer_svalue(svp = &apply_return_value, inter_sp--);
+                    pop_apply_value();
+                    svp = &apply_return_value;
                     if (!command_giver)
                         return MY_TRUE;
                 }
@@ -1214,6 +1216,7 @@ e_add_action (svalue_t *func, svalue_t *cmd, p_int flag)
 
     /* Allocate and initialise a new sentence */
     p = new_action_sent();
+    p->sent.type = SENT_PLAIN;
 
     if (func->type == T_STRING)
     {
@@ -1249,6 +1252,7 @@ e_add_action (svalue_t *func, svalue_t *cmd, p_int flag)
     {
         error_index = setup_closure_callback(&(p->cb), func
                                              , 0, NULL
+                                             , true
                                              );
         func->type = T_INVALID; /* So that an error won't free it again. */
     }
@@ -1270,7 +1274,6 @@ e_add_action (svalue_t *func, svalue_t *cmd, p_int flag)
 
     /* Set ->verb to the command verb, made tabled */
     p->verb = make_tabled(cmd->u.str); cmd->type = T_NUMBER;
-    p->sent.type = SENT_PLAIN;
     p->short_verb = p->short_verb_bytes = 0;
 
     if (flag)
@@ -1502,7 +1505,7 @@ f_execute_command (svalue_t *sp)
         errorf("Command too long (size: %zu): '%.200s...'\n", 
                len, get_txt(argp->u.str));
     strncpy(buf, get_txt(argp->u.str), len);
-    buf[len+1] = '\0';
+    buf[len] = '\0';
 
     origin = check_object(argp[1].u.ob);
     if (!origin)
@@ -1521,9 +1524,20 @@ f_execute_command (svalue_t *sp)
     /* Test if we are allowed to use this function */
     if (privilege_violation4(STR_EXECUTE_COMMAND, svalue_object(origin), argp->u.str, 0, sp))
     {
+        struct command_context_s context;
+
+        /* Save the current context, as it also contains command parsing information. */
+        save_command_context(&context);
+        context.rt.last = rt_context;
+        rt_context = (rt_context_t *)&context.rt;
+
         marked_command_giver = origin;
         command_giver = player;
         res = parse_command(buf, MY_TRUE);
+
+        /* Restore the previous context */
+        rt_context = context.rt.last;
+        restore_command_context(&context);
     }
 
     /* Clean up the stack and push the result. */

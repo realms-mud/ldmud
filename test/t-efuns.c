@@ -1,4 +1,4 @@
-#pragma save_types
+#pragma save_types, lightweight, clone
 
 #define OWN_PRIVILEGE_VIOLATION
 
@@ -8,6 +8,7 @@
 #include "/inc/deep_eq.inc"
 // String compiler header boundary
 #include "/sys/tls.h"
+#include "/sys/commands.h"
 #include "/sys/configuration.h"
 #include "/sys/driver_hook.h"
 #include "/sys/functionlist.h"
@@ -31,6 +32,7 @@ struct derived_struct (test_struct)
 };
 
 struct cs_opts (compile_string_options) {};
+struct tt_opts (to_type_options) {};
 
 mapping json_testdata = ([ "test 1": 42, "test 2": 42.0,
                           "test 3": "hello world\n",
@@ -56,13 +58,13 @@ string dhe_testdata =
 mixed global_var;
 
 int f(int arg);
-object clone = clonep() ? 0 : clone_object(this_object());
+object clone = (this_object() == blueprint()) && clone_object(this_object());
 
 string last_privi_op;
 mixed last_privi_who;
 mixed* last_privi_args;
 
-mixed *tests =
+mixed *tests = (this_object() == blueprint()) &&
 // String compiler test boundary
 ({
     // TODO: Add cases for indexing at string end ("abc"[3])
@@ -97,6 +99,10 @@ mixed *tests =
     ({ "acos 2", TF_ERROR, (: funcall(#'acos, "1.0") :) }),
     ({ "acos 3", TF_ERROR, (: acos(1.1) :) }),
     ({ "acos 4", TF_ERROR, (: acos(-1.1) :) }),
+    ({ "add_action with missing function",       0,        (: last_rt_warning = 0; add_action("ThisFunctionDoesNotExist", "test"); return sizeof(last_rt_warning); :) }),
+    ({ "add_action with operator closure",       TF_ERROR, (: add_action(#'switch,            "test"); :) }),
+    ({ "add_action with identifier closure",     TF_ERROR, (: add_action(#'global_var,        "test"); :) }),
+    ({ "add_action with unbound lambda closure", TF_ERROR, (: add_action(unbound_lambda(0,0), "test"); :) }),
     ({ "all_environment 1", 0,
 	(:
 	    object o = clone_object(this_object());
@@ -252,7 +258,10 @@ mixed *tests =
     ({ "call_direct_resolved array 1",  0, (: int* result; return deep_eq(call_direct_resolved(&result, ({clone,clone,object_name(clone),this_object(),0}), "f", 10, ({ 20 })), ({1, 1, 1, 1, 0})) && deep_eq(result, ({ 11, 11, 11, 11, 0})); :) }),
     ({ "call_direct_resolved array 2",  0, (: int* result; return deep_eq(call_direct_resolved(&result, ({clone,clone,object_name(clone),this_object(),0}), "g", 10, ({ 20 })), ({0, 0, 0, 0, 0})) && deep_eq(result, ({  0,  0,  0,  0, 0})); :) }),
     ({ "call_direct_resolved array 3",  0, (: int* result; return deep_eq(call_direct_resolved(&result, ({clone,clone,object_name(clone),this_object(),0}), "h", 10, ({ 20 })), ({0, 0, 0, 0, 0})) && deep_eq(result, ({  0,  0,  0,  0, 0})); :) }),
-    ({ "call_out", 0, (: last_rt_warning = 0; call_out("ThisFunctionDoesNotExist", 10); return sizeof(last_rt_warning); :) }),
+    ({ "call_out with missing function",0, (: last_rt_warning = 0; call_out("ThisFunctionDoesNotExist", 10); return sizeof(last_rt_warning); :) }),
+    ({ "call_out with operator closure",       TF_ERROR, (: call_out(#'switch, 0);            :) }),
+    ({ "call_out with identifier closure",     TF_ERROR, (: call_out(#'global_var, 0);        :) }),
+    ({ "call_out with unbound lambda closure", TF_ERROR, (: call_out(unbound_lambda(0,0), 0); :) }),
     ({ "catch 1", 0,                       (: catch(throw(''X)) == ''X                    :) }),
     ({ "catch 2", 0,                       (: catch(raise_error("X")) == "*X"             :) }),
     ({ "catch 3", 0,                       (: catch(1+1) == 0                             :) }),
@@ -448,6 +457,27 @@ mixed *tests =
                     ])))) == "ABCZ";
        :)
     }),
+    ({ "compile_string (uncallable closure from mapping) 1", TF_ERROR,
+       (:
+            funcall(compile_string(0, "fun1() + fun2(\"z\")", (<cs_opts>
+                functions:
+                    ([
+                        'fun1: #'switch,
+                        'fun2: unbound_lambda(0,0),
+                    ]))));
+       :)
+    }),
+    ({ "compile_string (uncallable closure from mapping) 2", 0,
+       (:
+            closure cl = unbound_lambda(0,0);
+            return deep_eq(funcall(compile_string(0, "({ #'fun1, #'fun2 })", (<cs_opts>
+                functions:
+                    ([
+                        'fun1: #'switch,
+                        'fun2: cl,
+                    ])))), ({ #'switch, cl }));
+       :)
+    }),
     ({ "compile_string (function from function)", 0,
        (:
             return funcall(compile_string(0, "fun1() + fun2(\"z\")", (<cs_opts>
@@ -461,6 +491,30 @@ mixed *tests =
                                 return #'capitalize;
                         }
                     }))) == "ABCZ";
+       :)
+    }),
+    ({ "compile_string (function from function within inline closure)", 0,
+       (:
+            return funcall(compile_string(0, "fun1() + fun2(\"Z\") + funcall(function string() { return fun2(\"Z\") + fun1(); }) + fun1() + fun2(\"Z\")", (<cs_opts>
+                functions: function closure(symbol name)
+                    {
+                        switch (to_string(name))
+                        {
+                            case "fun1":
+                                return function string() { return "ABC"; };
+                            case "fun2":
+                                return #'capitalize;
+                        }
+                    }))) == "ABCZZABCABCZ";
+       :)
+    }),
+    ({ "compile_string (same function multiple times from function)", 0,
+       (:
+            return funcall(compile_string(0, "fun1() + fun2() + fun3()", (<cs_opts>
+                functions: function closure(symbol name) : closure cl = function int() { return 10; }
+                    {
+                        return cl;
+                    }))) == 30;
        :)
     }),
     ({ "compile_string (missing function from function)", TF_ERROR,
@@ -541,6 +595,29 @@ mixed *tests =
                     }))) == "ABCX" && v2 == "X";
        :)
     }),
+    ({ "compile_string (variable from function within inline closure)", 0,
+       (:
+            string v1 = "ABC", v2 = "123";
+            return funcall(compile_string(0, "var1 + var2 + funcall(function string() { var2 = \"X\"; return var1 + var2; }) + var1 + var2", (<cs_opts>
+                variables: function mixed(symbol name) : string v2 = &v2
+                    {
+                        switch (to_string(name))
+                        {
+                            case "var1": return &v1;
+                            case "var2": return &v2;
+                        }
+                    }))) == "ABC123ABCXABCX" && v2 == "X";
+       :)
+    }),
+    ({ "compile_string (same value multiple times from function)", 0,
+       (:
+            return funcall(compile_string(0, "a+b+c", (<cs_opts>
+                variables: function mixed(symbol name) : int value = 10
+                    {
+                        return &value;
+                    }))) == 30;
+       :)
+    }),
     ({ "compile_string (variable, missing in function)", TF_ERROR,
        (:
             string v1 = "ABC";
@@ -619,6 +696,17 @@ mixed *tests =
                     }))), (<test_struct> ({10})));
        :)
     }),
+    ({ "compile_string (struct from function within inline closure)", 0,
+       (:
+            return deep_eq(funcall(compile_string(0,
+                "funcall(function struct my_struct() { return (<my_struct> ({10})); })", (<cs_opts>
+                structs: function struct mixed(symbol name)
+                    {
+                        if (name == 'my_struct)
+                            return (<test_struct> ({-1}));
+                    }))), (<test_struct> ({10})));
+       :)
+    }),
     ({ "compile_string (missing struct from function)", TF_ERROR,
        (:
             compile_string(0, "(<my_struct> ({10}))", (<cs_opts>
@@ -626,6 +714,16 @@ mixed *tests =
                     {
                         return 0;
                     }));
+       :)
+    }),
+    ({ "compile_string (same struct multiple times from function)", 0,
+       (:
+            return deep_eq(funcall(compile_string(0,
+                "({ (<my_struct1> ({10})), (<my_struct2> ({20})), (<my_struct3> ({30})) })", (<cs_opts>
+                structs: function struct mixed(symbol name) : struct test_struct s = (<test_struct>)
+                    {
+                        return s;
+                    }))), ({ (<test_struct> ({10})), (<test_struct> ({20})), (<test_struct> ({30})) }));
        :)
     }),
     ({ "compile_string (struct from object)", 0,
@@ -895,6 +993,40 @@ mixed *tests =
             return interactive_info(0, IC_ENCODING) == "ASCII";
         :)
     }),
+
+    ({ "execute_command", 0,
+       (:
+            string called_args;
+
+            efun::configure_object(this_object(), OC_COMMANDS_ENABLED, 1);
+            add_action(function int(string str) : string called_args = &called_args { called_args = str; return 1; }, "execute_command_test1");
+
+            if (!execute_command("execute_command_test1 ARGS", this_object(), this_object()))
+                return 0;
+            if (called_args != "ARGS")
+                return 0;
+            return 1;
+      :)
+    }),
+    ({ "execute_command with two consecutive calls", 0,
+       (:
+            string called_args;
+
+            efun::configure_object(this_object(), OC_COMMANDS_ENABLED, 1);
+            add_action(function int(string str) : string called_args = &called_args { called_args = str; return 1; }, "execute_command_test2");
+
+            if (!execute_command("execute_command_test2 ARGS", this_object(), this_object()))
+                return 0;
+            if (called_args != "ARGS")
+                return 0;
+            if (!execute_command("execute_command_test2 A", this_object(), this_object()))
+                return 0;
+            if (called_args != "A")
+                return 0;
+            return 1;
+      :)
+    }),
+
     ({ "get_type_info(int,0)", 0, (: get_type_info(10,              0) == T_NUMBER       :) }),
     ({ "get_type_info(str,0)", 0, (: get_type_info("10",            0) == T_STRING       :) }),
     ({ "get_type_info(str,1)", 0, (: get_type_info("10",            1) == 0              :) }), /* Shared string */
@@ -929,6 +1061,10 @@ mixed *tests =
             return 1;
         :)
     }),
+    ({ "input_to with missing function",       0,        (: last_rt_warning = 0; input_to("ThisFunctionDoesNotExist"); return sizeof(last_rt_warning); :) }),
+    ({ "input_to with operator closure",       TF_ERROR, (: input_to(#'switch);            :) }),
+    ({ "input_to with identifier closure",     TF_ERROR, (: input_to(#'global_var);        :) }),
+    ({ "input_to with unbound lambda closure", TF_ERROR, (: input_to(unbound_lambda(0,0)); :) }),
     ({ "save_object 1", 0, (: stringp(save_object()) :) }), /* Bug #594 */
     ({ "strstr 01", 0, (: strstr("","") == 0 :) }), /* Bug #536 */
     ({ "strstr 02", 0, (: strstr("","", 1) == -1 :) }),
@@ -954,7 +1090,7 @@ mixed *tests =
     ({ "text_width 11", 0, (: text_width("\U0001F1E9\U0001F1EA")             == 2 :) }),
     ({ "text_width 12", 0, (: text_width("\u1100\u1161\u11ab")               == 2 :) }),
     ({ "this_object", 0, (: this_object(({})...) == this_object() :) }),
-    ({ "this_player", 0, (: this_player(({})...) == 0 :) }),
+    ({ "this_player", 0, (: this_player(({})...) == this_object() :) }),
     ({ "hash string (MD5)", 0, (:
                          hash(TLS_HASH_MD5, "line 13: Warning: Missing "
                               "'return <value>' statement") ==
@@ -1054,27 +1190,118 @@ mixed *tests =
             return res;
         :)
     }),
-    ({ "filter array", TF_ERROR, (: filter(({1,2,3}), unbound_lambda(0,0), ({4,5,6})) :) }),
-    ({ "filter mapping", TF_ERROR, (: filter(([1,2,3]), unbound_lambda(0,0), ([4,5,6])) :) }),
+    ({ "filter string with operator closure",     TF_ERROR, (: filter("abc", #'switch, "xyz") :) }),
+    ({ "filter string with unbound lambda",       TF_ERROR, (: filter("abc", unbound_lambda(0,0), "xyz") :) }),
+    ({ "filter string with identifier closure",   0,        (: global_var = 0; return filter("abc", #'global_var, "xyz")==""; :) }),
+    ({ "filter array with operator closure",     TF_ERROR, (: filter(({1,2,3}), #'switch, ({4,5,6})) :) }),
+    ({ "filter array with unbound lambda",       TF_ERROR, (: filter(({1,2,3}), unbound_lambda(0,0), ({4,5,6})) :) }),
+    ({ "filter array with identifier closure",   0,        (: global_var = 0; return deep_eq(filter(({1,2,3}), #'global_var, ({4,5,6})), ({})); :) }),
+    ({ "filter mapping with operator closure",   TF_ERROR, (: filter(([1,2,3]), #'switch, ([4,5,6])) :) }),
+    ({ "filter mapping with unbound lambda",     TF_ERROR, (: filter(([1,2,3]), unbound_lambda(0,0), ([4,5,6])) :) }),
+    ({ "filter mapping with identifier closure", 0,        (: global_var = 1; return deep_eq(filter(([1,2,3]), #'global_var, ([4,5,6])), ([1,2,3])); :) }),
+    ({ "filter array with closure return lvalues", 0,
+       (:
+            mixed arr = ({ ({1}), ({2}), ({3})});
+            return deep_eq(filter(arr, function mixed(mixed val): { return &(val[0]); }), ({ ({1}), ({2}), ({3})}))
+                && deep_eq(arr, ({ ({1}), ({2}), ({3})}));
+       :)
+    }),
+
     ({ "map string 1", 0, (: map("abc", (['a':'x'])) == "xbc" :) }),
     ({ "map string 2", 0, (: map("abc", (['a':'x';'y']), 1) == "ybc" :) }),
     ({ "map string 3", TF_ERROR, (: map("abc", (['a']), 0) == "abc" :) }),
     ({ "map string 4", 0, (: map("abc", #'+, 1) == "bcd" :) }),
     ({ "map string 5", 0, (: map("abc", "f") == "bcd" :) }),
     ({ "map string 6", TF_ERROR, (: map("abc", unbound_lambda(0,0), ({1,2,3})) :) }),
-    ({ "map string x", TF_ERROR, (: map("abc", (['a':'x']), 2) :) }),
+    ({ "map string 7", TF_ERROR, (: map("abc", (['a':'x']), 2) :) }),
+    ({ "map string with operator closure", TF_ERROR, (: map("abc", #'switch) :) }),
+    ({ "map string with unbound lambda",   TF_ERROR, (: map("abc", unbound_lambda(0,0)) :) }),
+    ({ "map string with identifier closure", 0,      (: global_var = 'x'; return map("abc", #'global_var) == "xxx"; :) }),
     ({ "map array 1", 0, (: deep_eq(map(({1,2,3}), ([1:5])), ({5,2,3})) :) }),
     ({ "map array 2", 0, (: deep_eq(map(({1,2,3}), ([1:5;6]), 1),({6,2,3})) :) }),
     ({ "map array 3", TF_ERROR, (: map(({1,2,3}), ([1]), 0) :) }),
     ({ "map array 4", 0, (: deep_eq(map(({1,2,3}), #'+, 1), ({2,3,4})) :) }),
     ({ "map array 5", 0, (: deep_eq(map(({1,2,3}), "f"), ({2,3,4})) :) }),
     ({ "map array 6", TF_ERROR, (: map(({0}), unbound_lambda(0,0), ({1,2,3})) :) }),
+    ({ "map array with operator closure", TF_ERROR, (: map(({1,2,3}), #'switch) :) }),
+    ({ "map array with unbound lambda",   TF_ERROR, (: map(({1,2,3}), unbound_lambda(0,0)) :) }),
+    ({ "map array with identifier closure", 0,      (: global_var = 4; return deep_eq(map(({1,2,3}), #'global_var), ({4,4,4})); :) }),
     ({ "map mapping 1", TF_ERROR, (: deep_eq(map(([1,2,3]), ([1:5])), ({5,2,3})) :) }),
     ({ "map mapping 2", TF_ERROR, (: deep_eq(map(([1,2,3]), ([1:5;6]), 1),({6,2,3})) :) }),
     ({ "map mapping 3", TF_ERROR, (: map(([1,2,3]), ([1]), 0) :) }),
     ({ "map mapping 4", 0, (: deep_eq(map(([1,2,3]), (: $1 + $3 :), 1), ([1:2,2:3,3:4])) :) }),
     ({ "map mapping 5", 0, (: deep_eq(map(([1,2,3]), "f"), ([1:2,2:3,3:4])) :) }),
     ({ "map mapping 6", TF_ERROR, (: map(([]), unbound_lambda(0,0), ([1,2,3])) :) }),
+    ({ "map mapping with operator closure", TF_ERROR, (: map(([1,2,3]), #'switch) :) }),
+    ({ "map mapping with unbound lambda",   TF_ERROR, (: map(([1,2,3]), unbound_lambda(0,0)) :) }),
+    ({ "map mapping with identifier closure", 0,      (: global_var = "X"; return deep_eq(map(([1,2,3]), #'global_var), ([1:"X",2:"X",3:"X"])); :) }),
+    ({ "map array with closure return lvalues", 0,
+       (:
+            mixed arr = ({ ({1}), ({2}), ({3})});
+            return deep_eq(map(arr, function mixed(mixed val): { return &(val[0]); }), ({ 1, 2, 3 }))
+                && deep_eq(arr, ({ ({1}), ({2}), ({3})}));
+       :)
+    }),
+
+    ({ "match_command without matches", 0,
+      (:
+          return match_command("no_matching_action", this_object()) == ({});
+      :)
+    }),
+    ({ "match_command with a match", 0,
+      (:
+          closure cl = (: 1 :);
+          add_action(cl, "match_command_test1_action");
+          return deep_eq(match_command("match_command_test1_action", this_object()), ({ ({ "match_command_test1_action", 0, this_object(), cl }) }));
+      :)
+    }),
+    ({ "match_command with a match and arguments", 0,
+      (:
+          closure cl = (: 2 :);
+          add_action(cl, "match_command_test2_action");
+          return deep_eq(match_command("match_command_test2_action A B C", this_object()), ({ ({ "match_command_test2_action", "A B C", this_object(), cl }) }));
+      :)
+    }),
+    ({ "match_command with two matches", 0,
+      (:
+          closure cl1 = (: 3 :), cl2 = (: -3 :);
+          add_action(cl1, "match_command_test3_action");
+          add_action(cl2, "match_command_test3_action");
+          return deep_eq(match_command("match_command_test3_action X", this_object()),
+                         ({
+                            ({ "match_command_test3_action", "X", this_object(), cl2 }),
+                            ({ "match_command_test3_action", "X", this_object(), cl1 })
+                        }));
+      :)
+    }),
+    ({ "match_command with an AA_SHORT action", 0,
+      (:
+          closure cl = (: 4 :);
+          add_action(cl, "match_command_test4_action", AA_SHORT);
+          return deep_eq(match_command("match_command_test4_action_something X", this_object()), ({ ({ "match_command_test4_action_something", "X", this_object(), cl }) }));
+      :)
+    }),
+    ({ "match_command with an AA_NOSPACE action", 0,
+      (:
+          closure cl = (: 5 :);
+          add_action(cl, "match_command_test5_action", AA_NOSPACE);
+          return deep_eq(match_command("match_command_test5_action_something X", this_object()), ({ ({ "match_command_test5_action_something", "_something X", this_object(), cl }) }));
+      :)
+    }),
+    ({ "match_command with an AA_IMM_ARGS action", 0,
+      (:
+          closure cl = (: 6 :);
+          add_action(cl, "match_command_test6_action", AA_IMM_ARGS);
+          return deep_eq(match_command("match_command_test6_action_something X", this_object()), ({ ({ "match_command_test6_action", "_something X", this_object(), cl }) }));
+      :)
+    }),
+    ({ "match_command with a leading match", 0,
+      (:
+          closure cl = (: 7 :);
+          add_action(cl, "match_command_test7_action", -20);
+          return deep_eq(match_command("match_command_test7_act X", this_object()), ({ ({ "match_command_test7_act", "X", this_object(), cl }) }));
+      :)
+    }),
 
     ({ "lambda with many values", 0,
       (:
@@ -1103,10 +1330,54 @@ mixed *tests =
       :)
     }),
 
+    ({ "limited with operator closure", TF_ERROR, (: limited(#'switch) :) }),
+    ({ "limited with unbound_lambda",   TF_ERROR, (: limited(unbound_lambda(0,0)) :) }),
+    ({ "limited with identifier closure", 0,      (: global_var = "X"; return limited(#'global_var) == "X"; :) }),
+
     ({ "load_object 1", 0, (: load_object(__FILE__) == this_object() :) }),
     ({ "load_object 2", 0, (: load_object("/" __FILE__) == this_object() :) }),
     ({ "load_object 3", 0, (: load_object("./" __FILE__) == this_object() :) }),
     ({ "load_object 4", 0, (: load_object("/./" __FILE__) == this_object() :) }),
+
+    ({ "m_contains 1", 0, (: return m_contains((["A", "B"]), "A"); :) }),
+    ({ "m_contains 2", 0, (: return m_contains((["A", "B"]), "C") == 0; :) }),
+    ({ "m_contains 3", 0, (: mixed a, b, c; return m_contains(&a, &b, &c, (["A": 1; 2; 3, "B": 4; 5; 6]), "A") && a == 1 && b == 2 && c == 3; :) }),
+    ({ "m_contains 4", 0, (: mixed a = 10, b = 11, c = 12; return m_contains(&a, &b, &c, (["A": 1; 2; 3, "B": 4; 5; 6]), "C") == 0 && a == 10 && b == 11 && c == 12; :) }),
+    ({ "m_contains 5", TF_ERROR, (: return m_contains((["A": 1, "B": 2]), "A"); :) }),
+    ({ "m_contains 6", TF_ERROR, (: int a, b; return m_contains(&a, &b, (["A": 1, "B": 2]), "A"); :) }),
+    ({ "m_contains 7", 0,
+       (:
+            mixed a;
+            mapping m = (["A": 1, "B": 2]);
+
+            walk_mapping(m, (: 0 :));
+            if (!m_contains(&a, m, "A"))
+                return 0;
+
+            a += 10; // Shouldn't change m.
+            return deep_eq(m, (["A": 1, "B": 2]));
+         :)
+    }),
+
+#if __EFUN_DEFINED__(parse_command)
+    ({ "parse_command of \"take apple\"", 0,
+       (:
+            mixed *items;
+            if (!parse_command("take apple", ({ this_object() }), " 'get' / 'take' %i ", items))
+                return 0;
+            return deep_eq(items, ({ 1, this_object() }));
+        :)
+    }),
+    ({ "parse_command of \"look at apple\"", 0,
+       (:
+            mixed *items;
+            string* prepos = ({ "towards", "at" });
+            if (!parse_command("look at apple", ({ this_object() }), " 'look' %p %i ", prepos, items))
+                return 0;
+            return prepos[0] == "at" && deep_eq(items, ({ 1, this_object() }));
+        :)
+    }),
+#endif
 
     ({ "regmatch 1", 0, (: regmatch("abcd", "abc") == "abc" :) }),
     ({ "regmatch 2", 0, (: regmatch("abcd", "abcdef") == 0 :) }),
@@ -1130,6 +1401,10 @@ mixed *tests =
     ({ "regreplace 2", 0, (: regreplace("A\x00BC", "\\x00.", "X", RE_PCRE) == "AXC" :) }),
     ({ "regreplace 3", 0, (: regreplace("A\x00BC", "B", "X", RE_TRADITIONAL) == "A\x00XC" :) }),
     ({ "regreplace 4", 0, (: regreplace("A\x00BC", "B", "X", RE_PCRE) == "A\x00XC" :) }),
+
+#ifdef __SQLITE__
+    ({ "sl_open with illegal path", TF_ERROR, (: sl_open("whatever/../../somethingelse.db"); :) }),
+#endif
 
     ({ "sscanf 1", 0, (: sscanf("A10", "A%~d") == 1 :) }),
     ({ "sscanf 2", 0, (: sscanf("B10", "A%~d") == 0 :) }),
@@ -1294,6 +1569,8 @@ mixed *tests =
                         :) }),
     ({ "to_text 10", 0, (: deep_eq(to_array(to_text(({65, 192, 9786, 127154}))), ({65, 192, 9786, 127154}))
                         :) }),
+    ({ "to_text 11", 0, (: to_text(({"Ignored", 0}), "ASCII") :) }),
+    ({ "to_text 12", TF_ERROR, (: to_text(({0}), "Illegal Encoding") :) }),
 
     ({ "to_bytes 1", 0, (: deep_eq(to_array(to_bytes( ({}) )), ({}) ) :) }),
     ({ "to_bytes 2", 0, (: deep_eq(to_array(to_bytes( ({0, 130, 150, 200, 255}) )), ({0, 130, 150, 200, 255}) ) :) }),
@@ -1345,6 +1622,102 @@ mixed *tests =
     ({ "to_struct templated from array 2", 0, (: deep_eq(to_struct(({({10, 20}), ({30, 40})}), (<test_struct>)), (<test_struct> ({10,20}))) :) }),
     ({ "to_struct derived from base struct", 0, (: mixed b = (<test_struct> ({10,20})); return deep_eq(to_struct(b, (<derived_struct>)), (<derived_struct> ({10,20}), 0)); :) }),
     ({ "to_struct base from derived struct", 0, (: mixed d = (<derived_struct> ({10,20}), ({"A","B"})); return deep_eq(to_struct(d, (<test_struct>)), (<test_struct> ({10,20}))); :) }),
+
+    ({ "to_type int* to mixed*",                          0, (: deep_eq(to_type(({1,2,3}), [mixed*]), ({1,2,3})) :) }),
+    ({ "to_type int* to string",                          0, (: deep_eq(to_type(({76,68,77,117,100}), [string]), "LDMud") :) }),
+    ({ "to_type int* to bytes",                           0, (: deep_eq(to_type(({76,68,77,117,100}), [bytes]), b"LDMud") :) }),
+    ({ "to_type mixed* to int*",                          0, (: deep_eq(to_type(({1,2,3}), [int*]), ({1,2,3})) :) }),
+    ({ "to_type string* to int*",                         0, (: deep_eq(to_type(({"1", "-20", "0x30", "-0b100"}), [int*]), ({1, -20, 48, -4})) :) }),
+    ({ "to_type mixed* to string*",                       0, (: deep_eq(to_type(({"abc", 0, 1, 2.3}), [string*]), ({"abc", "0", "1", "2.3"})) :) }),
+    ({ "to_type mixed* to string* with keep_zero",        0, (: deep_eq(to_type(({"abc", 0, 1, 2.3}), [string*], (<tt_opts> keep_zero: 1)), ({"abc", 0, "1", "2.3"})) :) }),
+    ({ "to_type mixed* to struct mixed",                  0, (: deep_eq(to_type(({"abc", 3, #'abs}), [struct mixed]), to_struct(({"abc", 3, #'abs}))) :) }),
+    ({ "to_type mixed* to derived_struct",                0, (: deep_eq(to_type(({ ({1, "2", 3.3}), ({4, "5", 6.6}) }), [struct derived_struct]), (<derived_struct> arg: ({1, 2, 3}), values: ({"4", "5", "6.6"})) ) :) }),
+    ({ "to_type mixed* to string|mapping",                0, (: deep_eq(to_type(({"abc", 5, #'to_type}), [string|mapping]), (["abc", 5, #'to_type])) :) }),
+    ({ "to_type mixed* to quoted array",                  0, (: deep_eq(to_type(({"abc", 5, #'to_type}), decltype('({}))), '({"abc", 5, #'to_type})) :) }),
+    ({ "to_type bytes to bytes|int*",                     0, (: deep_eq(to_type(b"\x01\x02\x03", [bytes|int*]) , b"\x01\x02\x03") :) }),
+    ({ "to_type bytes to string without encoding", TF_ERROR, (: to_type(b"\xe2\x98\xba\xe2\x98\xb9", [string]) :) }),
+    ({ "to_type bytes to string with encoding",           0, (: deep_eq(to_type(b"\xe2\x98\xba\xe2\x98\xb9", [string], (<tt_opts> source_encoding: "utf-8")), "\u263a\u2639") :) }),
+    ({ "to_type bytes to int*",                           0, (: deep_eq(to_type(b"\x01\x02\x03", [int*]) , ({1,2,3})) :) }),
+    ({ "to_type efun closure to closure|object",          0, (: to_type(#'abs, [closure|object]) == #'abs :) }),
+    ({ "to_type efun closure to object",                  0, (: to_type(#'abs, [object]) == this_object() :) }),
+    ({ "to_type lfun closure to object",                  0, (: to_type(#'f, [object]) == this_object() :) }),
+    ({ "to_type variable closure to object",              0, (: to_type(#'b, [object]) == this_object() :) }),
+    ({ "to_type lambda closure to object",                0, (: to_type(lambda(0,0), [object]) == this_object() :) }),
+    ({ "to_type efun closure to lwobject",                0, (: lwobject lwo = new_lwobject(object_name()); return to_type(lwo.get_efun_closure(), [lwobject]) == lwo; :) }),
+    ({ "to_type lfun closure to lwobject",                0, (: lwobject lwo = new_lwobject(object_name()); return to_type(lwo.get_lfun_closure(), [lwobject]) == lwo; :) }),
+    ({ "to_type var closure to lwobject",                 0, (: lwobject lwo = new_lwobject(object_name()); return to_type(lwo.get_var_closure(), [lwobject]) == lwo; :) }),
+    ({ "to_type lambda closure to lwobject",              0, (: lwobject lwo = new_lwobject(object_name()); return to_type(bind_lambda(unbound_lambda(0,0), lwo), [lwobject]) == lwo; :) }),
+    ({ "to_type variable closure to int",                 0, (: to_type(#'b, [int]) == 3 :) }),
+    ({ "to_type efun closure to string",                  0, (: "abs" in to_type(#'abs, [string]) :) }),
+    ({ "to_type lfun closure to string",                  0, (: "msg" in to_type(#'msg, [string]) :) }),
+    ({ "to_type variable closure to string",              0, (: "global_var" in to_type(#'global_var, [string]) :) }),
+    ({ "to_type lambda closure to string",                0, (: "lambda" in to_type(lambda(0,0), [string]) :) }),
+    ({ "to_type coroutine to coroutine|string",           0, (: coroutine cr = async function void() {}; return to_type(cr, [coroutine|string]) == cr; :) }),
+    ({ "to_type coroutine to string",                     0, (: object_name() in to_type(async function void() {}, [string]) :) }),
+    ({ "to_type int to int|string",                       0, (: to_type(11, [int|string]) == 11 :) }),
+    ({ "to_type int to float|string",                     0, (: floatp(to_type(11, [float|string])) && to_type(11, [float|string]) == 11.0  :) }),
+    ({ "to_type int to string|object",                    0, (: to_type(11, [string|object]) == "11" :) }),
+    ({ "to_type float to float|int",                      0, (: to_type(11.235, [int|float]) == 11.235 :) }),
+    ({ "to_type float to int|string",                     0, (: to_type(11.235, [int|string]) == 11 :) }),
+    ({ "to_type float to string|object",                  0, (: to_type(11.235, [string|object]) == "11.235" :) }),
+    ({ "to_type lpctype to lpctype*",                     0, (: deep_eq(mkmapping(to_type([int|float|string], [lpctype*])), ([ [int], [float], [string] ])) :) }),
+    ({ "to_type lpctype to mixed*",                       0, (: deep_eq(mkmapping(to_type([mixed*|object], [mixed*|object])), ([ [mixed*], [object] ])) :) }),
+    ({ "to_type lpctype to mapping",                      0, (: deep_eq(to_type([int|float|string], [mapping]), ([ [int], [float], [string] ])) :) }),
+    ({ "to_type lwobject to lwobject|string",             0, (: lwobject lwo = new_lwobject(object_name()); return to_type(lwo, [lwobject|string]) == lwo; :) }),
+    ({ "to_type lwobject to string",                      0, (: lwobject lwo = new_lwobject(object_name()); return object_name() in to_type(lwo, [string]); :) }),
+    ({ "to_type mapping to mapping|mixed*",               0, (: mapping m = (["a", "b", "c"]); return to_type(m, [mapping|mixed*]) == m; :) }),
+    ({ "to_type mapping to derived_struct",               0, (: deep_eq(to_type((["values":({"1","2",3}), "arg":({"4","5",6})]), [struct derived_struct]), (<derived_struct> arg: ({4, 5, 6}), values: ({"1", "2", "3"})) ) :) }),
+    ({ "to_type wide mapping to derived_struct",          0, (: deep_eq(to_type((["values":"1";"2";3, "arg":"4";"5";6]), [struct derived_struct]), (<derived_struct> arg: ({4, 5, 6}), values: ({"1", "2", "3"})) ) :) }),
+    ({ "to_type empty mapping to derived_struct",         0, (: deep_eq(to_type(([]), [struct derived_struct]), (<derived_struct>) ) :) }),
+    ({ "to_type mapping to struct mixed",                 0, (: deep_eq(to_type((["field1": "abc", "field2": 3, "field3": #'abs]), [struct mixed]), to_struct((["field1": "abc", "field2": 3, "field3": #'abs]))) :) }),
+    ({ "to_type mapping to <string**>",                   0, (: deep_eq(sort_array(to_type((["a":"x";"y";"z", "b":"1";"2";3]), [string**]), (: $1[0] > $2[0] :)), ({ ({ "a", "x", "y", "z" }), ({"b", "1", "2", "3"}) })) :) }),
+    ({ "to_type mapping to <string*>",                    0, (: deep_eq(sort_array(to_type(([65, 66, 67]), [string*]), #'>), ({ "A", "B", "C"})) :) }),
+    ({ "to_type mapping to <mapping*>",                   0, (: deep_eq(to_type((["a":"b";"c";"d"]), [mapping*]), ({ ([ "a", "b", "c", "d" ]) })) :) }),
+    ({ "to_type object to object|string",                 0, (: to_type(this_object(), [object|string]) == this_object() :) }),
+    ({ "to_type object to string",                        0, (: object_name() in to_type(this_object(), [string]) :) }),
+    ({ "to_type quoted_array to quoted_array|array",      0, (: mixed arr = '({'L', 'D'}); return to_type(arr, decltype('({}))|[mixed*]) == arr; :) }),
+    ({ "to_type quoted_array to array",                   0, (: deep_eq(to_type('({'L', 'D'}), [mixed*]), ({'L', 'D'})) :) }),
+    ({ "to_type quoted_array to string",                  0, (: to_type('({'L', 'D'}), [string]) == "LD" :) }),
+    ({ "to_type string to string|int",                    0, (: to_type("123", [string|int]) == "123" :) }),
+    ({ "to_type string to symbol",                        0, (: to_type("abc", [symbol]) == 'abc :) }),
+    ({ "to_type string to int",                           0, (: to_type("0x123", [int]) == 0x123 :) }),
+    ({ "to_type string(__INT_MAX__) to int",              0, (: to_type(to_string(__INT_MAX__), [int]) == __INT_MAX__ :) }),
+    ({ "to_type string(__INT_MIN__) to int",              0, (: to_type(to_string(__INT_MIN__), [int]) == __INT_MIN__ :) }),
+    ({ "to_type string to int",                           0, (: to_type("0x123", [int]) == 0x123 :) }),
+    ({ "to_type string to float",                         0, (: to_type("3.25", [float]) == 3.25 :) }),
+    ({ "to_type long string to float",                    0, (: to_type("0.00000000000000000000000000000000000000001", [float]) == 0.00000000000000000000000000000000000000001 :) }),
+    ({ "to_type string to lpctype",                       0, (: to_type("string|lpctype", [lpctype]) == [string|lpctype] :) }),
+    ({ "to_type string to object",                        0, (: to_type(object_name(), [object]) == this_object() :) }),
+    ({ "to_type string to bytes without encoding", TF_ERROR, (: to_type("\u263a\u2639", [bytes]) :) }),
+    ({ "to_type string to bytes with encoding",           0, (: to_type("\u263a\u2639", [bytes], (<tt_opts> target_encoding: "utf-8")) == b"\xe2\x98\xba\xe2\x98\xb9" :) }),
+    ({ "to_type string to int*",                          0, (: deep_eq(to_type("\u263a\u2639", [int*]) , ({0x263a, 0x2639})) :) }),
+    ({ "to_type derived_struct to test_struct",           0, (: struct derived_struct s = (<derived_struct> values: ({"A", "B"}), arg: ({1, 2})); return to_type(s, [struct test_struct]) == s; :) }),
+    ({ "to_type test_struct to derived_struct",           0, (: deep_eq(to_type((<test_struct> arg: ({1, 2})), [struct derived_struct]), (<derived_struct> arg: ({1,2}))) :) }),
+    ({ "to_type derived_struct to mapping",               0, (: deep_eq(to_type((<derived_struct> values: ({"A", "B"}), arg: ({1, 2})), [mapping]), (["values": ({"A","B"}), "arg": ({1,2})])) :) }),
+    ({ "to_type derived_struct to string",                0, (: "derived_struct" in to_type((<derived_struct> values: ({"A", "B"}), arg: ({1, 2})), [string]) :) }),
+    ({ "to_type symbol to symbol|string",                 0, (: to_type('LDMud, [symbol|string]) == 'LDMud :) }),
+    ({ "to_type symbol to string",                        0, (: to_type('LDMud, [string]) == "LDMud" :) }),
+    ({ "to_type symbol to int*",                          0, (: deep_eq(to_type('abc, [int*]), ({'a', 'b', 'c'})) :) }),
+    ({ "to_type array range to quoted array",             0, (: mixed* arr = ({ 1, 2, 3, 4, 5 }), *range = ({ &(arr[2..3]) }); return deep_eq(to_type(range, decltype(({'({}) }))), ({ '({3,4}) })); :) }),
+    ({ "to_type string range to int",                     0, (: string s = "12345", *range = ({ &(s[2..3]) }); return deep_eq(to_type(range, [int*]), ({ 34 })); :) }),
+    ({ "to_type string range to string",                  0, (: string s = "12345", *range = ({ &(s[2..3]) }); return deep_eq(to_type(range, [string*]), ({ "34" })); :) }),
+    ({ "to_type string range to symbol",                  0, (: string s = "LDMud", *range = ({ &(s[2..3]) }); return deep_eq(to_type(range, [symbol*]), ({ 'Mu })); :) }),
+    ({ "to_type string range to object",                  0, (: string s = "__" + object_name() + "__", *range = ({ &(s[2..<3]) }); return deep_eq(to_type(range, [object*]), ({ this_object()})); :) }),
+    ({ "to_type string range to lpctype",                 0, (: string s = "int|string|object", *range = ({ &(s[4..9]) }); return deep_eq(to_type(range, [lpctype*]), ({ [string] })); :) }),
+    ({ "to_type bytes range to bytes",                    0, (: bytes b = b"LDMud", *range = ({ &(b[2..3]) }); return deep_eq(to_type(range, [bytes*]), ({ b"Mu" })); :) }),
+    ({ "to_type bytes range to string",                   0, (: bytes b = b"LDMud", *range = ({ &(b[2..3]) }); return deep_eq(to_type(range, [string*], (<tt_opts> source_encoding: "utf-8")), ({ "Mu" })); :) }),
+    ({ "to_type existing map range to string",            0, (: mapping m = ([ "A": 1;2;3;4;5 ]); int** range = ({ &(m["A",2..3]) }); return deep_eq(to_type(range, [string*]), ({ "\x03\x04" })); :) }),
+    ({ "to_type existing map range to byte",              0, (: mapping m = ([ "A": 1;2;3;4;5 ]); int** range = ({ &(m["A",2..3]) }); return deep_eq(to_type(range, [bytes*]), ({ b"\x03\x04" })); :) }),
+    ({ "to_type existing map range to int*"    ,          0, (: mapping m = ([ "A": 1;2;3;4;5 ]); int** range = ({ &(m["A",2..3]) }); return deep_eq(to_type(range, [int**]), ({ ({3,4}) })); :) }),
+    ({ "to_type existing map range to mapping",           0, (: mapping m = ([ "A": 1;2;3;4;5 ]); int** range = ({ &(m["A",2..3]) }); return deep_eq(to_type(range, [mapping*]), ({ ([3,4]) })); :) }),
+    ({ "to_type existing map range to struct mixed",      0, (: mapping m = ([ "A": 1;2;3;4;5 ]); int** range = ({ &(m["A",2..3]) }); return deep_eq(to_type(range, [struct mixed*]), ({ to_struct(({3,4})) })); :) }),
+    ({ "to_type existing map range to derived_struct",    0, (: mapping m = ([ "A": 1;2;({3});({4});5 ]); int** range = ({ &(m["A",2..3]) }); return deep_eq(to_type(range, [struct derived_struct*]), ({ (<derived_struct> arg: ({3}), values: ({"4"})) })); :) }),
+    ({ "to_type non-existing map range to string",        0, (: mapping m = ([ "A": 1;2;3;4;5 ]); int** range = ({ &(m["B",2..3]) }); return deep_eq(to_type(range, [string*]), ({ "\x00\x00" })); :) }),
+    ({ "to_type non-existing map range to byte",          0, (: mapping m = ([ "A": 1;2;3;4;5 ]); int** range = ({ &(m["B",2..3]) }); return deep_eq(to_type(range, [bytes*]), ({ b"\x00\x00" })); :) }),
+    ({ "to_type non-existing map range to int*",          0, (: mapping m = ([ "A": 1;2;3;4;5 ]); int** range = ({ &(m["B",2..3]) }); return deep_eq(to_type(range, [int**]), ({ ({0,0}) })); :) }),
+    ({ "to_type non-existing map range to mapping",       0, (: mapping m = ([ "A": 1;2;3;4;5 ]); int** range = ({ &(m["B",2..3]) }); return deep_eq(to_type(range, [mapping*]), ({ ([0]) })); :) }),
+    ({ "to_type non-existing map range to struct mixed",  0, (: mapping m = ([ "A": 1;2;3;4;5 ]); int** range = ({ &(m["B",2..3]) }); return deep_eq(to_type(range, [struct mixed*]), ({ to_struct(({0,0})) })); :) }),
+    ({ "to_type non-existing map range to derived_struct",0, (: mapping m = ([ "A": 1;2;3;4;5 ]); int** range = ({ &(m["B",2..3]) }); return deep_eq(to_type(range, [struct derived_struct*]), ({ (<derived_struct>) })); :) }),
 
     ({ "get_type_info with temporary anonymous struct 1", 0, (: deep_eq(get_type_info(to_struct((["A": 10]))), ({ T_STRUCT, "anonymous" })) :) }),
     ({ "get_type_info with temporary anonymous struct 2", 0, (: !strstr(get_type_info(to_struct((["A": 10])), 2), "anonymous ") :) }),
@@ -1653,6 +2026,8 @@ string *epilog(int eflag)
         return 0;
     });
 
+    set_this_player(this_object());
+
     run_test();
     return 0;
 }
@@ -1665,6 +2040,8 @@ int privilege_violation(string op, mixed who, varargs mixed* args)
 
     return 1;
 }
+
+string* parse_command_id_list() { return ({ "apple" }); }
 
 int f(int arg)
 {
@@ -1682,6 +2059,10 @@ int get_args()
 {
     return args;
 }
+
+closure get_lfun_closure() { return #'f; }
+closure get_var_closure() { return #'b; }
+closure get_efun_closure() { return #'abs; }
 
 struct derived_struct get_struct()
 {

@@ -85,6 +85,8 @@ class TestObject(unittest.TestCase):
         self.assertEqual(args[1].type, ldmud.Array[ldmud.String])
 
         self.assertEqual(fun(10, "A", "B", "C"), 3)
+        with self.assertRaises(ValueError):
+            fun(ldmud.Array([1]), ldmud)
 
     def testVariableInfo(self):
         ob = ldmud.Object("/testob")
@@ -125,6 +127,10 @@ class TestObject(unittest.TestCase):
         ldmud.efuns.destruct(ob)
         self.assertFalse(lfun)
         self.assertFalse(var)
+        with self.assertRaises(ValueError):
+            lfun(42)
+        with self.assertRaises(ValueError):
+            var.value
 
     def testDict(self):
         ob = ldmud.Object("/testob")
@@ -576,6 +582,8 @@ class TestClosure(unittest.TestCase):
         s2 = ldmud.Closure(self.master, "this_object")
         self.assertEqual(s2, s)
         self.assertIn(s2, set((s,)))
+        with self.assertRaises(ValueError):
+            s(ldmud.Array([1]), ldmud)
 
     def testLWOEfun(self):
         lwob = ldmud.LWObject("/testob")
@@ -602,6 +610,8 @@ class TestClosure(unittest.TestCase):
         s2 = ldmud.Closure(self.master, "master_fun", self.master)
         self.assertEqual(s2, s)
         self.assertIn(s2, set((s,)))
+        with self.assertRaises(ValueError):
+            s(ldmud.Array([1]), ldmud)
 
     def testDestructedLfun(self):
         ob = ldmud.Object("/testob")
@@ -1002,7 +1012,6 @@ class TestLPCType(unittest.TestCase):
         self.assertIn(ldmud.String, ldmud.Integer | ldmud.String)
         self.assertEqual(ldmud.LPCType((ldmud.Integer, ldmud.String)), ldmud.Integer | ldmud.String)
 
-
 class TestEfuns(unittest.TestCase):
     def testDir(self):
         self.assertGreater(len(dir(ldmud.efuns)), 200)
@@ -1011,6 +1020,45 @@ class TestEfuns(unittest.TestCase):
         master = ldmud.efuns.find_object("/master")
         self.assertEqual(ldmud.efuns.call_other(master, "master_fun"), 54321)
         self.assertEqual(ldmud.efuns.object_name(master), "/master")
+
+    def testCallWithInvalidArg(self):
+        with self.assertRaises(ValueError):
+            ldmud.efuns.call_other(ldmud.get_master(), "fun", ldmud.Array([1]), ldmud)
+
+class TestRegisteredEfuns(unittest.TestCase):
+    def testDir(self):
+        self.assertIn("python_test", dir(ldmud.registered_efuns))
+        self.assertGreater(len(dir(ldmud.registered_efuns)), 16)
+
+    def testDict(self):
+        self.assertIn("python_test", ldmud.registered_efuns.__dict__)
+        self.assertEqual(ldmud.registered_efuns.__dict__["python_test"], python_test)
+        self.assertEqual(len(ldmud.registered_efuns.__dict__), 16)
+
+    def testAttribute(self):
+        self.assertTrue(hasattr(ldmud.registered_efuns, 'python_test'))
+        self.assertEqual(ldmud.registered_efuns.python_test, python_test)
+        with self.assertRaises(AttributeError):
+            ldmud.registered_efuns.doesnt_exist
+        with self.assertRaises(AttributeError):
+            # Unregistered Efun
+            ldmud.registered_efuns.abc
+
+class TestRegisteredTypes(unittest.TestCase):
+    def testDir(self):
+        self.assertIn("bigint", dir(ldmud.registered_types))
+        self.assertGreater(len(dir(ldmud.registered_types)), 3)
+
+    def testDict(self):
+        self.assertIn("bigint", ldmud.registered_types.__dict__)
+        self.assertEqual(ldmud.registered_types.__dict__["bigint"], bigint)
+        self.assertEqual(len(ldmud.registered_types.__dict__), 3)
+
+    def testAttribute(self):
+        self.assertTrue(hasattr(ldmud.registered_types, 'bigint'))
+        self.assertEqual(ldmud.registered_types.bigint, bigint)
+        with self.assertRaises(AttributeError):
+            ldmud.registered_types.doesnt_exist
 
 def python_test():
     """Run the python test cases."""
@@ -1182,6 +1230,9 @@ class box:
     def __save__(self):
         return self.value
 
+    def __convert__(self, target, opts):
+        return ldmud.efuns.to_type(self.value, target, *(o for o in (opts,) if o is not None))
+
     @staticmethod
     def __restore__(val):
         return box(val)
@@ -1203,6 +1254,8 @@ ldmud.register_hook(ldmud.ON_OBJECT_CREATED, ob_created)
 ldmud.register_hook(ldmud.ON_OBJECT_DESTRUCTED, ob_destroyed)
 
 ldmud.register_efun("python_get_hook_info", get_hook_info)
+ldmud.register_type("bigint", bigint)
+ldmud.register_type("bigint", int)
 ldmud.register_type("bigint", bigint)
 ldmud.register_efun("to_bigint", to_bigint)
 ldmud.register_type("random_generator", random_generator)

@@ -968,7 +968,8 @@ python_register_type (PyObject *module, PyObject *args, PyObject *kwds)
         }
 
         for (int i = 0; i < REAL_EFUN_COUNT; i++)
-            xfree(python_type_entry->efun[i].types);
+            if (python_type_entry->efun[i].exists)
+                xfree(python_type_entry->efun[i].types);
     }
     else
     {
@@ -1829,6 +1830,8 @@ ldmud_lpctype_type_dealloc (ldmud_gc_lpctype_type_t* self)
 
     remove_gc_lpctype_object(self);
 
+    if (Py_TYPE(self)->tp_flags & Py_TPFLAGS_HAVE_GC)
+        PyObject_GC_UnTrack(self);
     Py_XDECREF(self->ldmud_lpctype.type_base.tp_base);
     Py_XDECREF(self->ldmud_lpctype.type_base.tp_dict);
     Py_XDECREF(self->ldmud_lpctype.type_base.tp_bases);
@@ -2128,6 +2131,8 @@ ldmud_concrete_array_type_dealloc (ldmud_concrete_array_type_t* self)
  */
 
 {
+    if (Py_TYPE(self)->tp_flags & Py_TPFLAGS_HAVE_GC)
+        PyObject_GC_UnTrack(self);
     Py_XDECREF(self->element_type);
     Py_XDECREF(self->ldmud_lpctype.type_base.tp_base);
     Py_XDECREF(self->ldmud_lpctype.type_base.tp_dict);
@@ -2400,6 +2405,8 @@ ldmud_concrete_struct_type_dealloc (ldmud_concrete_struct_type_t* self)
     free_struct_name(self->name);
     REMOVE_GC_OBJECT(gc_struct_type_list, self);
 
+    if (Py_TYPE(self)->tp_flags & Py_TPFLAGS_HAVE_GC)
+        PyObject_GC_UnTrack(self);
     Py_XDECREF(self->ldmud_lpctype.type_base.tp_base);
     Py_XDECREF(self->ldmud_lpctype.type_base.tp_dict);
     Py_XDECREF(self->ldmud_lpctype.type_base.tp_bases);
@@ -3438,6 +3445,11 @@ ldmud_program_check_available (ldmud_program_t* self)
 
         case T_OBJECT:
             /* Make the program resident */
+            if (!check_object(self->lpc_object.u.ob))
+            {
+                PyErr_Format(PyExc_ValueError, "object is destructed");
+                return false;
+            }
             if (O_PROG_SWAPPED(self->lpc_object.u.ob))
             {
                 self->lpc_object.u.ob->time_of_ref = current_time;
@@ -3735,7 +3747,7 @@ ldmud_program_lfun_call (ldmud_program_and_index_t *lfun, PyObject *arg, PyObjec
             if (err != NULL)
             {
                 PyErr_SetString(PyExc_ValueError, err);
-                pop_n_elems(i, sp);
+                pop_n_elems(i, sp-1);
                 return NULL;
             }
         }
@@ -8405,6 +8417,22 @@ static ldmud_lpctype_t ldmud_struct_type =
 },  ldmud_struct_get_lpctype            /* get_lpctype */
 };
 
+/*-------------------------------------------------------------------------*/
+static PyObject*
+ldmud_struct_create (struct_t* st)
+
+/* Creates a new Python struct from an LPC struct.
+ */
+
+{
+    PyObject* val = ldmud_struct_new(&ldmud_struct_type.type_base, NULL, NULL);
+    if (val != NULL)
+        ((ldmud_struct_t*)val)->lpc_struct = ref_struct(st);
+
+    return val;
+} /* ldmud_struct_create() */
+
+/*-------------------------------------------------------------------------*/
 static PyObject*
 ldmud_concrete_struct_new (PyTypeObject *type, PyObject *args, PyObject *kwds)
 
@@ -8788,7 +8816,7 @@ ldmud_closure_call (ldmud_closure_t *cl, PyObject *arg, PyObject *kw)
             if (err != NULL)
             {
                 PyErr_SetString(PyExc_ValueError, err);
-                pop_n_elems(i, sp);
+                pop_n_elems(i, sp-1);
                 return NULL;
             }
         }
@@ -11644,7 +11672,7 @@ ldmud_efun_call (ldmud_efun_t *func, PyObject *arg, PyObject *kw)
             if (err != NULL)
             {
                 PyErr_SetString(PyExc_ValueError, err);
-                pop_n_elems(i, sp);
+                pop_n_elems(i, sp-1);
                 return NULL;
             }
         }
@@ -11812,6 +11840,352 @@ create_efun_namespace ()
 
     return (PyObject*)&ldmud_efun_namespace;
 } /* create_efun_namespace() */
+
+/*-------------------------------------------------------------------------*/
+static PyObject*
+ldmud_registered_efuns_getattro (PyObject *val, PyObject *name)
+
+/* Return the callable for a registered efun.
+ */
+
+{
+    PyObject *result;
+    bool error;
+    string_t* efunname;
+    ident_t *ident;
+
+    /* First check real attributes... */
+    result = PyObject_GenericGetAttr(val, name);
+    if (result || !PyErr_ExceptionMatches(PyExc_AttributeError))
+        return result;
+
+    PyErr_Clear();
+
+    /* And now look up registered efuns. */
+    efunname = find_tabled_python_string(name, "efun name", &error);
+    if (error)
+        return NULL;
+
+    if (efunname)
+    {
+        ident = find_shared_identifier_mstr(efunname, I_TYPE_GLOBAL, 0);
+        while (ident && ident->type != I_TYPE_GLOBAL)
+            ident = ident->inferior;
+
+        if (ident && ident->type == I_TYPE_GLOBAL && ident->u.global.python_efun != I_GLOBAL_PYTHON_EFUN_OTHER)
+        {
+            result = python_efun_table[ident->u.global.python_efun].callable;
+            if (result)
+            {
+                Py_INCREF(result);
+                return result;
+            }
+        }
+    }
+
+    PyErr_Format(PyExc_AttributeError, "No such registered efun: '%U'", name);
+    return NULL;
+} /* ldmud_registered_efuns_getattro() */
+
+/*-------------------------------------------------------------------------*/
+static PyObject *
+ldmud_registered_efuns_dir (PyObject *self)
+
+/* Returns a list of all attributes, this includes all registered efun names.
+ */
+
+{
+    PyObject *result;
+    PyObject *attrs = get_class_dir(self);
+
+    if (attrs == NULL)
+        return NULL;
+
+    /* Now add all registered efuns. */
+    for (ident_t *ident = all_python_efuns; ident; ident = ident->next_all)
+    {
+        if (python_efun_table[ident->u.global.python_efun].callable != NULL)
+        {
+            PyObject *efunname = PyUnicode_FromStringAndSize(get_txt(ident->name), mstrsize(ident->name));
+
+            if (efunname == NULL)
+            {
+                PyErr_Clear();
+                continue;
+            }
+
+            if (PySet_Add(attrs, efunname) < 0)
+                PyErr_Clear();
+            Py_DECREF(efunname);
+        }
+    }
+
+    /* And return the keys of our dict. */
+    result = PySequence_List(attrs);
+    Py_DECREF(attrs);
+    return result;
+} /* ldmud_registered_efuns_dir() */
+
+/*-------------------------------------------------------------------------*/
+static PyObject *
+ldmud_registered_efuns_dict (ldmud_program_t *self, void *closure)
+
+/* Returns a list of all registered efuns.
+ */
+
+{
+    PyObject *result, *dict = PyDict_New();
+    if (!dict)
+        return NULL;
+
+    for (ident_t *ident = all_python_efuns; ident; ident = ident->next_all)
+    {
+        PyObject * callable = python_efun_table[ident->u.global.python_efun].callable;
+        if (callable != NULL)
+        {
+            PyObject *efunname = PyUnicode_FromStringAndSize(get_txt(ident->name), mstrsize(ident->name));
+
+            if (efunname == NULL)
+            {
+                PyErr_Clear();
+                continue;
+            }
+
+            if (PyDict_SetItem(dict, efunname, callable) < 0)
+                PyErr_Clear();
+            Py_DECREF(efunname);
+        }
+    }
+
+    result = PyDictProxy_New(dict);
+    Py_DECREF(dict);
+    return result;
+} /* ldmud_registered_efuns_dict() */
+
+/*-------------------------------------------------------------------------*/
+static PyMethodDef ldmud_registered_efuns_methods[] =
+{
+    {
+        "__dir__",
+        (PyCFunction)ldmud_registered_efuns_dir, METH_NOARGS,
+        "__dir__() -> List\n\n"
+        "Returns a list of all attributes."
+    },
+
+    {NULL}
+};
+
+static PyGetSetDef ldmud_registered_efuns_getset [] = {
+    {"__dict__", (getter)ldmud_registered_efuns_dict, NULL, NULL},
+    {NULL}
+};
+
+static PyTypeObject ldmud_registered_efuns_type =
+{
+    PyVarObject_HEAD_INIT(NULL, 0)
+    "ldmud.registered_efuns",           /* tp_name */
+    0,                                  /* tp_basicsize */
+    0,                                  /* tp_itemsize */
+    0,                                  /* tp_dealloc */
+    0,                                  /* tp_print */
+    0,                                  /* tp_getattr */
+    0,                                  /* tp_setattr */
+    0,                                  /* tp_reserved */
+    0,                                  /* tp_repr */
+    0,                                  /* tp_as_number */
+    0,                                  /* tp_as_sequence */
+    0,                                  /* tp_as_mapping */
+    0,                                  /* tp_hash  */
+    0,                                  /* tp_call */
+    0,                                  /* tp_str */
+    ldmud_registered_efuns_getattro,    /* tp_getattro */
+    0,                                  /* tp_setattro */
+    0,                                  /* tp_as_buffer */
+    Py_TPFLAGS_DEFAULT,                 /* tp_flags */
+    "Registered Python efuns",          /* tp_doc */
+    0,                                  /* tp_traverse */
+    0,                                  /* tp_clear */
+    0,                                  /* tp_richcompare */
+    0,                                  /* tp_weaklistoffset */
+    0,                                  /* tp_iter */
+    0,                                  /* tp_iternext */
+    ldmud_registered_efuns_methods,     /* tp_methods */
+    0,                                  /* tp_members */
+    ldmud_registered_efuns_getset,      /* tp_getset */
+};
+
+/*-------------------------------------------------------------------------*/
+static PyObject*
+ldmud_registered_types_getattro (PyObject *val, PyObject *name)
+
+/* Return the class for a registered type.
+ */
+
+{
+    PyObject *result;
+    bool error;
+    string_t* typename;
+    ident_t *ident;
+
+    /* First check real attributes... */
+    result = PyObject_GenericGetAttr(val, name);
+    if (result || !PyErr_ExceptionMatches(PyExc_AttributeError))
+        return result;
+
+    PyErr_Clear();
+
+    /* And now look up registered types. */
+    typename = find_tabled_python_string(name, "type name", &error);
+    if (error)
+        return NULL;
+
+    if (typename)
+    {
+        ident = find_shared_identifier_mstr(typename, I_TYPE_PYTHON_TYPE, 0);
+        while (ident && ident->type != I_TYPE_PYTHON_TYPE)
+            ident = ident->inferior;
+
+        if (ident && ident->type == I_TYPE_PYTHON_TYPE)
+        {
+            result = python_type_table[ident->u.python_type_id]->pytype;
+            if (result)
+            {
+                Py_INCREF(result);
+                return result;
+            }
+        }
+    }
+
+    PyErr_Format(PyExc_AttributeError, "No such registered type: '%U'", name);
+    return NULL;
+} /* ldmud_registered_types_getattro() */
+
+/*-------------------------------------------------------------------------*/
+static PyObject *
+ldmud_registered_types_dir (PyObject *self)
+
+/* Returns a list of all attributes, this includes all registered type names.
+ */
+
+{
+    PyObject *result;
+    PyObject *attrs = get_class_dir(self);
+
+    if (attrs == NULL)
+        return NULL;
+
+    /* Now add all registered types. */
+    for (ident_t *ident = all_python_types; ident; ident = ident->next_all)
+    {
+        if (python_type_table[ident->u.python_type_id]->pytype != NULL)
+        {
+            PyObject *typename = PyUnicode_FromStringAndSize(get_txt(ident->name), mstrsize(ident->name));
+
+            if (typename == NULL)
+            {
+                PyErr_Clear();
+                continue;
+            }
+
+            if (PySet_Add(attrs, typename) < 0)
+                PyErr_Clear();
+            Py_DECREF(typename);
+        }
+    }
+
+    /* And return the keys of our dict. */
+    result = PySequence_List(attrs);
+    Py_DECREF(attrs);
+    return result;
+} /* ldmud_registered_types_dir() */
+
+/*-------------------------------------------------------------------------*/
+static PyObject *
+ldmud_registered_types_dict (ldmud_program_t *self, void *closure)
+
+/* Returns a list of all registered types.
+ */
+
+{
+    PyObject *result, *dict = PyDict_New();
+    if (!dict)
+        return NULL;
+
+    for (ident_t *ident = all_python_types; ident; ident = ident->next_all)
+    {
+        PyObject *type = python_type_table[ident->u.python_type_id]->pytype;
+        if (type != NULL)
+        {
+            PyObject *typename = PyUnicode_FromStringAndSize(get_txt(ident->name), mstrsize(ident->name));
+
+            if (typename == NULL)
+            {
+                PyErr_Clear();
+                continue;
+            }
+
+            if (PyDict_SetItem(dict, typename, type) < 0)
+                PyErr_Clear();
+            Py_DECREF(typename);
+        }
+    }
+
+    result = PyDictProxy_New(dict);
+    Py_DECREF(dict);
+    return result;
+} /* ldmud_registered_types_dict() */
+
+/*-------------------------------------------------------------------------*/
+static PyMethodDef ldmud_registered_types_methods[] =
+{
+    {
+        "__dir__",
+        (PyCFunction)ldmud_registered_types_dir, METH_NOARGS,
+        "__dir__() -> List\n\n"
+        "Returns a list of all attributes."
+    },
+
+    {NULL}
+};
+
+static PyGetSetDef ldmud_registered_types_getset [] = {
+    {"__dict__", (getter)ldmud_registered_types_dict, NULL, NULL},
+    {NULL}
+};
+
+static PyTypeObject ldmud_registered_types_type =
+{
+    PyVarObject_HEAD_INIT(NULL, 0)
+    "ldmud.registered_types",           /* tp_name */
+    0,                                  /* tp_basicsize */
+    0,                                  /* tp_itemsize */
+    0,                                  /* tp_dealloc */
+    0,                                  /* tp_print */
+    0,                                  /* tp_getattr */
+    0,                                  /* tp_setattr */
+    0,                                  /* tp_reserved */
+    0,                                  /* tp_repr */
+    0,                                  /* tp_as_number */
+    0,                                  /* tp_as_sequence */
+    0,                                  /* tp_as_mapping */
+    0,                                  /* tp_hash  */
+    0,                                  /* tp_call */
+    0,                                  /* tp_str */
+    ldmud_registered_types_getattro,    /* tp_getattro */
+    0,                                  /* tp_setattro */
+    0,                                  /* tp_as_buffer */
+    Py_TPFLAGS_DEFAULT,                 /* tp_flags */
+    "Registered Python types",          /* tp_doc */
+    0,                                  /* tp_traverse */
+    0,                                  /* tp_clear */
+    0,                                  /* tp_richcompare */
+    0,                                  /* tp_weaklistoffset */
+    0,                                  /* tp_iter */
+    0,                                  /* tp_iternext */
+    ldmud_registered_types_methods,     /* tp_methods */
+    0,                                  /* tp_members */
+    ldmud_registered_types_getset,      /* tp_getset */
+};
 
 
 /*-------------------------------------------------------------------------*/
@@ -12165,6 +12539,10 @@ init_ldmud_module ()
         return NULL;
     if (PyType_Ready(&ldmud_lvalue_struct_members_type) < 0)
         return NULL;
+    if (PyType_Ready(&ldmud_registered_efuns_type) < 0)
+        return NULL;
+    if (PyType_Ready(&ldmud_registered_types_type) < 0)
+        return NULL;
 
     ldmud_interrupt_exception_type.tp_base = (PyTypeObject *) PyExc_RuntimeError;
     if (PyType_Ready(&ldmud_interrupt_exception_type) < 0)
@@ -12201,6 +12579,8 @@ init_ldmud_module ()
     if (!efuns)
         return NULL;
     PyModule_AddObject(module, "efuns", efuns);
+    PyModule_AddObject(module, "registered_efuns", ldmud_registered_efuns_type.tp_alloc(&ldmud_registered_efuns_type, 0));
+    PyModule_AddObject(module, "registered_types", ldmud_registered_types_type.tp_alloc(&ldmud_registered_types_type, 0));
 
     return module;
 } /* init_ldmud_module() */
@@ -12545,13 +12925,7 @@ svalue_to_python (svalue_t *svp)
             return ldmud_quoted_array_create(svp);
 
         case T_STRUCT:
-        {
-            PyObject* val = ldmud_struct_new(&ldmud_struct_type.type_base, NULL, NULL);
-            if (val != NULL)
-                ((ldmud_struct_t*)val)->lpc_struct = ref_struct(svp->u.strct);
-
-            return val;
-        }
+            return ldmud_struct_create(svp->u.strct);
 
         case T_LVALUE:
             return ldmud_lvalue_create(svp);
@@ -14581,6 +14955,162 @@ restore_python_ob (svalue_t *dest, string_t *name, svalue_t *value)
 
     return true;
 } /* restore_python_ob() */
+
+/*-------------------------------------------------------------------------*/
+bool
+convert_python_ob (svalue_t *dest, svalue_t *ob,  lpctype_t *type, struct_t *opts)
+
+/* Convert a Python object to <type> of possible. Return true on success.
+ */
+
+{
+    PyObject *fun, *pyob;
+    bool started = python_start_thread();
+
+    assert(ob->type == T_PYTHON);
+    assert(python_type_table[ob->x.python_type] != NULL);
+
+    pyob = (PyObject*)ob->u.generic;
+    fun = PyObject_GetAttrString(pyob, "__convert__");
+    if (fun != NULL)
+    {
+        PyObject *args = PyTuple_New(2);
+        PyObject *result, *pytype, *pyopts;
+        bool was_external = python_is_external;
+
+        if (args == NULL)
+        {
+            Py_DECREF(fun);
+            raise_python_error("to_type", started);
+        }
+
+        pytype = lpctype_to_pythontype(type);
+        if (pytype == NULL)
+        {
+            Py_DECREF(fun);
+            Py_DECREF(args);
+            raise_python_error("to_type", started);
+        }
+        PyTuple_SET_ITEM(args, 0, pytype);
+
+        if (opts)
+            pyopts = ldmud_struct_create(opts);
+        else
+        {
+            Py_INCREF(Py_None);
+            pyopts = Py_None;
+        }
+        if (pyopts == NULL)
+        {
+            Py_DECREF(fun);
+            Py_DECREF(args);
+            raise_python_error("to_type", started);
+        }
+        PyTuple_SET_ITEM(args, 1, pyopts);
+
+        python_is_external = false;
+        python_save_context();
+
+        result = PyObject_CallObject(fun, args);
+
+        python_clear_context();
+        python_is_external = was_external;
+        Py_DECREF(fun);
+        Py_DECREF(args);
+
+        if (result == NULL)
+            raise_python_error("to_type", started);
+        else if (result == Py_NotImplemented)
+        {
+            Py_DECREF(result);
+            python_finish_thread(started);
+            return false;
+        }
+        else
+        {
+            const char* err = python_to_svalue(dest, result);
+            Py_DECREF(result);
+            python_finish_thread(started);
+
+            if (err != NULL)
+                errorf("Bad return value from __convert__: %s\n", err);
+
+            return true;
+        }
+    }
+    PyErr_Clear();
+
+    /* Convert doesn't exist. Let's try native magic functions. */
+    if (lpctype_contains(lpctype_int, type))
+    {
+        PyObject* result = PyNumber_Long(pyob);
+        if (result != NULL)
+        {
+            const char* err = python_to_svalue(dest, result);
+            Py_DECREF(result);
+            python_finish_thread(started);
+
+            if (err != NULL)
+                errorf("Bad return value from __int__: %s\n", err);
+
+            return true;
+        }
+        PyErr_Clear();
+    }
+
+    if (lpctype_contains(lpctype_float, type))
+    {
+        PyObject* result = PyNumber_Float(pyob);
+        if (result != NULL)
+        {
+            const char* err = python_to_svalue(dest, result);
+            Py_DECREF(result);
+            python_finish_thread(started);
+
+            if (err != NULL)
+                errorf("Bad return value from __float__: %s\n", err);
+
+            return true;
+        }
+        PyErr_Clear();
+    }
+
+    if (lpctype_contains(lpctype_string, type))
+    {
+        PyObject* result = PyObject_Str(pyob);
+        if (result != NULL)
+        {
+            const char* err = python_to_svalue(dest, result);
+            Py_DECREF(result);
+            python_finish_thread(started);
+
+            if (err != NULL)
+                errorf("Bad return value from __str__: %s\n", err);
+
+            return true;
+        }
+        PyErr_Clear();
+    }
+
+    if (lpctype_contains(lpctype_bytes, type))
+    {
+        PyObject* result = PyObject_Bytes(pyob);
+        if (result != NULL)
+        {
+            const char* err = python_to_svalue(dest, result);
+            Py_DECREF(result);
+            python_finish_thread(started);
+
+            if (err != NULL)
+                errorf("Bad return value from __bytes__: %s\n", err);
+
+            return true;
+        }
+        PyErr_Clear();
+    }
+
+    return false;
+} /* convert_python_ob() */
 
 /*-------------------------------------------------------------------------*/
 string_t*

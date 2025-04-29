@@ -2138,7 +2138,7 @@ load_object (const char *lname, Bool create_super, int depth
 
             if (strcmp(pInherited, name) == 0)
             {
-                errorf("Illegal to inherit self.\n");
+                load_object_error("Illegal to inherit self", name, chain);
             }
 
             if (depth >= MAX_LOAD_DEPTH)
@@ -4038,10 +4038,12 @@ setup_function_callback_base ( callback_t *cb, svalue_t ob, string_t * fun
 /*-------------------------------------------------------------------------*/
 int
 setup_closure_callback ( callback_t *cb, svalue_t *cl
-                       , int nargs, svalue_t * args)
+                       , int nargs, svalue_t * args
+                       , bool expect_code)
 
 /* Setup the empty/uninitialized callback <cb> to hold a closure
  * call to <cl> with the <nargs> arguments starting from <args>.
+ * If <expect_code> is true, identifier closures are not allowed.
  *
  * Both <cl> and the arguments are adopted (taken away from the caller).
  *
@@ -4056,7 +4058,7 @@ setup_closure_callback ( callback_t *cb, svalue_t *cl
     cb->is_closure = MY_TRUE;
     transfer_svalue_no_free(&(cb->function.closure), cl);
 
-    if (cb->function.closure.x.closure_type == CLOSURE_UNBOUND_LAMBDA)
+    if (!is_closure_callable(&(cb->function.closure), expect_code))
     {
         /* Uncalleable closure  */
         error_index = 0;
@@ -4123,7 +4125,7 @@ setup_efun_callback_base ( callback_t **cb, svalue_t *args, int nargs
     if (args[0].type == T_CLOSURE)
     {
         memsafe(*cb = xalloc(sizeof(callback_t)) , sizeof(callback_t), "callback structure");
-        error_index = setup_closure_callback(*cb, args, nargs-1, args+1);
+        error_index = setup_closure_callback(*cb, args, nargs-1, args+1, false);
     }
     else if (args[0].type == T_STRING)
     {
@@ -4416,8 +4418,7 @@ execute_callback (callback_t *cb, int nargs, Bool keep, Bool toplevel)
         }
 
         call_lambda(&(cb->function.closure), num_arg + nargs);
-        transfer_svalue(&apply_return_value, inter_sp);
-        inter_sp--;
+        pop_apply_value();
 
         if (toplevel)
             current_prog = NULL;
@@ -4430,7 +4431,10 @@ execute_callback (callback_t *cb, int nargs, Bool keep, Bool toplevel)
         if (ob.type == T_OBJECT
          ? !sapply(cb->function.named.name, ob.u.ob, num_arg + nargs)
          : !sapply_lwob(cb->function.named.name, ob.u.lwob, num_arg + nargs))
-            transfer_svalue(&apply_return_value, &const0);
+        {
+            free_svalue(&apply_return_value);
+            apply_return_value = const0;
+        }
     }
 
     if (!keep)
